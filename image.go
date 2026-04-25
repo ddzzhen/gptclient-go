@@ -94,8 +94,8 @@ func (c *Client) PollAndDownloadImage(conversationID string) (string, error) {
 	return "", fmt.Errorf("image download timeout")
 }
 
-// downloadImageByFileID 直接用已知 file_id 下载图片（从 WebSocket asset_pointer 提取）
-func (c *Client) downloadImageByFileID(fileID, conversationID string) (string, error) {
+// DownloadImageByFileID 直接用已知 file_id 下载图片（从 WebSocket asset_pointer 提取）
+func (c *Client) DownloadImageByFileID(fileID, conversationID string) (string, error) {
 	return c.downloadImage(fileID, conversationID)
 }
 

@@ -45,7 +45,7 @@ func buildCfg(ua, buildHash, lang, sid string, t0 int64, perfNow float64) []inte
 	return []interface{}{
 		3000,
 		jsDateString(time.Now()),
-		4294967296,
+		int64(4294967296),
 		nil,
 		ua,
 		"",

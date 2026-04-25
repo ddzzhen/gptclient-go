@@ -24,3 +24,19 @@ sentinel-go
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 编译和运行生成的文件
+*.h
+1.exe
+images/
+
+# 测试和易语言工程文件
+*.e
+*.bak
+examples/
+
+# 专门针对 DLL 封装的代码（纯本地使用）
+cmd/dll/
+
+# 配置文件 (避免泄露 Token)
+config.json

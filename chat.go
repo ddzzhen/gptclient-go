@@ -113,18 +113,20 @@ func (c *Client) ChatStream(userMsg string, handler StreamHandler) (*ChatResult,
 	c.logf("[info] conversation_id=%s, turn=%d, reply=%d字",
 		c.conversationID, c.turnCount, len([]rune(result.Text)))
 
-	if result.ImageFileID != "" && result.ConversationID != "" {
-		// 从 WebSocket asset_pointer 直接拿到文件 ID，无需轮询
-		c.logf("[image] 直接下载图片: %s", result.ImageFileID)
-		imgPath, err := c.downloadImageByFileID(result.ImageFileID, result.ConversationID)
-		if err != nil {
-			c.logf("[image] 下载失败: %v", err)
+	if !c.DisableAutoImage {
+		if result.ImageFileID != "" && result.ConversationID != "" {
+			// 从 WebSocket asset_pointer 直接拿到文件 ID，无需轮询
+			c.logf("[image] 直接下载图片: %s", result.ImageFileID)
+			imgPath, err := c.DownloadImageByFileID(result.ImageFileID, result.ConversationID)
+			if err != nil {
+				c.logf("[image] 下载失败: %v", err)
+			}
+			result.ImagePath = imgPath
+		} else if result.ImageTaskID != "" && result.ConversationID != "" {
+			// 回退：轮询对话详情找 asset_pointer
+			imgPath, _ := c.PollAndDownloadImage(result.ConversationID)
+			result.ImagePath = imgPath
 		}
-		result.ImagePath = imgPath
-	} else if result.ImageTaskID != "" && result.ConversationID != "" {
-		// 回退：轮询对话详情找 asset_pointer
-		imgPath, _ := c.PollAndDownloadImage(result.ConversationID)
-		result.ImagePath = imgPath
 	}
 
 	return result, nil
@@ -306,7 +308,7 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 	}
 
 	// 图片生成场景：conversation-turn topic 上为流式思考（delta），conversation-update 上为快照与图片 asset_pointer
-	if result.ImageTaskID != "" && wsConn != nil && result.ConversationID != "" {
+	if !c.DisableAutoImage && result.ImageTaskID != "" && wsConn != nil && result.ConversationID != "" {
 		if handoffTopicID != "" {
 			c.logf("[image-ws] 订阅 %s 并同时监听 conversation-update...", handoffTopicID)
 			if err := c.subscribeWSImageCombined(wsConn, handoffTopicID, result.ConversationID, result, &lastText, handler); err != nil {

@@ -37,6 +37,10 @@ type Client struct {
 
 	// Logf 日志输出函数，设为 nil 可禁用日志。默认 log.Printf。
 	Logf LogFunc
+
+	// DisableAutoImage 设为 true 时，Chat/ChatStream 不会自动阻塞等待图片下载。
+	// 适合 DLL / 外部调用场景，由调用方自己异步处理图片下载。
+	DisableAutoImage bool
 }
 
 // NewClient 创建新的 ChatGPT 客户端
@@ -87,6 +91,9 @@ func (c *Client) GetModel() string { return c.model }
 
 // SetTempMode 设置临时模式
 func (c *Client) SetTempMode(enabled bool) { c.tempMode = enabled }
+
+// SetDisableAutoImage 设置是否禁用自动图片下载（DLL 场景使用）
+func (c *Client) SetDisableAutoImage(disabled bool) { c.DisableAutoImage = disabled }
 
 // SetConversationID 恢复到指定对话
 func (c *Client) SetConversationID(id string) { c.conversationID = id }
