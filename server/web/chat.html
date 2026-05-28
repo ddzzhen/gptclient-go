@@ -156,7 +156,7 @@ select option{background:var(--s2)}
         <div class="input-box">
           <div class="input-top">
             <button class="attach-btn" onclick="document.getElementById('file-input').click()">📎</button>
-            <input type="file" id="file-input" accept="image/*" multiple style="display:none">
+            <input type="file" id="file-input" accept="image/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.md" multiple style="display:none">
             <textarea id="user-input" rows="1" placeholder="输入消息... (Shift+Enter 换行，Enter 发送)"></textarea>
           </div>
           <!-- 底部工具栏：始终显示图片模式切换，激活后展开参数 -->
@@ -215,14 +215,23 @@ document.getElementById('user-input').addEventListener('paste', (e) => {
 
 function handleFiles(files) {
   for (const file of files) {
-    if (!file || !file.type.startsWith('image/')) continue;
+    if (!file) continue;
     const reader = new FileReader();
     reader.onload = (ev) => {
-      attachedImages.push({ b64: ev.target.result, file: file });
+      attachedImages.push({ b64: ev.target.result, file: file, isImage: file.type.startsWith('image/') });
       renderAttachments();
     };
     reader.readAsDataURL(file);
   }
+}
+
+function fileIcon(mime) {
+  if (mime.includes('pdf')) return '📄';
+  if (mime.includes('word') || mime.includes('msword')) return '📝';
+  if (mime.includes('excel') || mime.includes('spreadsheet') || mime.includes('csv')) return '📊';
+  if (mime.includes('powerpoint') || mime.includes('presentation')) return '📊';
+  if (mime.includes('text') || mime.includes('json') || mime.includes('markdown')) return '📃';
+  return '📎';
 }
 
 function renderAttachments() {
@@ -231,7 +240,13 @@ function renderAttachments() {
   attachedImages.forEach((item, idx) => {
     const div = document.createElement('div');
     div.className = 'preview-item';
-    div.innerHTML = `<img src="${item.b64}"><button class="rm-btn" onclick="removeAttachment(${idx})">×</button>`;
+    if (item.isImage) {
+      div.innerHTML = `<img src="${item.b64}" style="max-width:70px;max-height:70px;border-radius:4px;object-fit:cover"><button class="rm-btn" onclick="removeAttachment(${idx})">×</button>`;
+    } else {
+      const icon = fileIcon(item.file.type);
+      const name = item.file.name.length > 14 ? item.file.name.slice(0, 12) + '…' : item.file.name;
+      div.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:70px;height:70px;background:var(--bg2);border-radius:6px;font-size:.7rem;color:var(--text);gap:4px;padding:4px;text-align:center;overflow:hidden"><span style="font-size:1.5rem">${icon}</span><span style="word-break:break-all">${escHtml(name)}</span></div><button class="rm-btn" onclick="removeAttachment(${idx})">×</button>`;
+    }
     container.appendChild(div);
   });
 }
@@ -436,7 +451,9 @@ async function sendMessage() {
               // 图片模式：只在收到 markdown 图片链接时才更新气泡，过滤中间文字
               const imgMatch = fullText.match(/!\[[^\]]*\]\([^)]+\)/g);
               if (imgMatch) {
-                aiBubble.innerHTML = imgMatch.map(md => formatText(md)).join('');
+                const imgHtml = imgMatch.map(md => formatText(md)).join('');
+                const countHint = imgMatch.length > 1 ? `<div style="color:var(--muted);font-size:.78rem;margin-bottom:4px">共 ${imgMatch.length} 张图片</div>` : '';
+                aiBubble.innerHTML = countHint + imgHtml;
                 scrollBottom();
               }
             } else {

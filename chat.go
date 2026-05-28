@@ -68,20 +68,26 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 		promptText += "\n\n将宽高比设为 " + string(opts.ImageAspect)
 	}
 
+	// 区分图片（multimodal）和文档（my_files）
+	// 图片需要插入 content.parts 作为 image_asset_pointer；文档只放 metadata.attachments
 	var parts []interface{}
-	for _, img := range opts.Images {
-		parts = append(parts, img.ToAssetPointerPart())
+	hasImages := false
+	for _, f := range opts.Images {
+		if f.UseCase == "multimodal" {
+			parts = append(parts, f.ToAssetPointerPart())
+			hasImages = true
+		}
 	}
 	parts = append(parts, promptText)
 
 	contentType := "text"
-	if len(opts.Images) > 0 {
+	if hasImages {
 		contentType = "multimodal_text"
 	}
 
 	attachments := []Attachment{}
-	for _, img := range opts.Images {
-		attachments = append(attachments, img.ToAttachment())
+	for _, f := range opts.Images {
+		attachments = append(attachments, f.ToAttachment())
 	}
 
 	msgID := GenerateUUID()
@@ -355,11 +361,19 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 	if !c.DisableAutoImage && result.ImageTaskID != "" && result.ConversationID != "" {
 		// 图片生成场景：使用 HTTP 轮询 stream_status，比 WebSocket 更可靠
 		c.logf("[image-poll] 开始轮询图片生成进度, conversation=%s", result.ConversationID)
-		if fileID, err := c.pollImageStreamStatus(result.ConversationID); err != nil {
+		if fileIDs, lastMsgID, err := c.pollImageStreamStatus(result.ConversationID); err != nil {
 			c.logf("[image-poll] 轮询失败: %v", err)
 		} else {
-			result.ImageFileID = fileID
-			c.logf("[image-poll] 图片已就绪: %s", fileID)
+			result.ImageFileIDs = fileIDs
+			if len(fileIDs) > 0 {
+				result.ImageFileID = fileIDs[0]
+			}
+			// 用图片生成后对话链的最后节点 ID 作为下轮 parent_message_id，确保多轮对话连续
+			if lastMsgID != "" {
+				result.LastAssistantMsgID = lastMsgID
+				c.logf("[image-poll] 更新 parentMsgID=%s", lastMsgID)
+			}
+			c.logf("[image-poll] 图片已就绪: %d 张, IDs=%v", len(fileIDs), fileIDs)
 		}
 	} else if handoffTopicID != "" && wsConn != nil {
 		// 普通文字场景走 topic SSE 续流
@@ -370,7 +384,7 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 	}
 
 	// 图片生成成功后清除排队提示文字，只保留图片 URL
-	if result.ImageFileID != "" {
+	if len(result.ImageFileIDs) > 0 {
 		lastText = ""
 	}
 	result.Text = lastText
@@ -948,41 +962,52 @@ func (c *Client) processFullSSE(evt map[string]interface{}, result *ChatResult, 
 	}
 }
 
-// pollImageStreamStatus 通过 HTTP 轮询等待图片生成完成，返回图片 file ID
-// 策略：先等 stream_status=COMPLETE（SSE 流结束），再继续轮询对话直到图片出现
-func (c *Client) pollImageStreamStatus(conversationID string) (string, error) {
+// pollImageStreamStatus 通过 HTTP 轮询等待图片生成完成，返回所有图片 file ID 列表和对话末尾消息 ID
+// 策略：先等 stream_status=COMPLETE，再持续轮询对话，直到没有 intermediate 节点为止
+// （多图场景：每张图片是独立节点，分批完成，必须等所有节点完成才能拿全）
+// 返回：fileIDs, lastMsgID（对话 current_node，用于下轮 parent_message_id）, error
+func (c *Client) pollImageStreamStatus(conversationID string) ([]string, string, error) {
 	const (
 		totalTimeout = 10 * time.Minute
 		pollInterval = 5 * time.Second
 	)
 	deadline := time.Now().Add(totalTimeout)
 
-	// 第一阶段：等待 SSE stream 结束（通常很快，几秒内）
-	streamDone := false
-	for !streamDone && time.Now().Before(deadline) {
+	// 第一阶段：等待 SSE stream 结束（通常几秒内）
+	for time.Now().Before(deadline) {
 		status, err := c.fetchStreamStatus(conversationID)
 		if err != nil {
 			c.logf("[image-poll] stream_status 请求失败: %v，重试...", err)
 		} else {
 			c.logf("[image-poll] stream_status=%s", status)
 			if strings.EqualFold(status, "COMPLETE") {
-				streamDone = true
 				break
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
 
-	// 第二阶段：轮询对话详情，等待图片文件 ID 出现（图片异步生成中）
+	// 第二阶段：轮询对话详情
+	// 多图时每张图片是独立节点，必须等所有节点都不再 intermediate 才算完成
 	for time.Now().Before(deadline) {
-		fileID, err := c.fetchConversationImageFileID(conversationID)
-		if err == nil && fileID != "" {
-			return fileID, nil
+		fileIDs, lastMsgID, hasPending, err := c.fetchConversationImageFileIDs(conversationID)
+		if err != nil {
+			c.logf("[image-poll] 对话查询失败: %v，重试...", err)
+			time.Sleep(pollInterval)
+			continue
+		}
+		if hasPending {
+			c.logf("[image-poll] 已收到 %d 张图片，仍有生成中的节点，继续等待...", len(fileIDs))
+			time.Sleep(pollInterval)
+			continue
+		}
+		if len(fileIDs) > 0 {
+			return fileIDs, lastMsgID, nil
 		}
 		c.logf("[image-poll] 图片尚未就绪，等待中...")
 		time.Sleep(pollInterval)
 	}
-	return "", fmt.Errorf("等待图片超时（%v）", totalTimeout)
+	return nil, "", fmt.Errorf("等待图片超时（%v）", totalTimeout)
 }
 
 // fetchStreamStatus 查询对话的 stream_status
@@ -1006,26 +1031,32 @@ func (c *Client) fetchStreamStatus(conversationID string) (string, error) {
 	return result.Status, nil
 }
 
-// fetchConversationImageFileID 获取对话中最新生成的图片文件 ID
-func (c *Client) fetchConversationImageFileID(conversationID string) (string, error) {
+// fetchConversationImageFileIDs 获取对话中所有图片文件 ID 列表
+// 返回：fileIDs（已就绪图片 ID），currentNode（对话末尾节点 ID，用于下轮 parent_message_id），hasPending，error
+// 多图场景下，每张图片可能是独立的 multimodal_text 节点，分批完成
+func (c *Client) fetchConversationImageFileIDs(conversationID string) (fileIDs []string, currentNode string, hasPending bool, err error) {
 	apiPath := "/backend-api/conversation/" + conversationID
-	resp, err := c.httpClient.R().
+	resp, respErr := c.httpClient.R().
 		SetHeaders(map[string]string{
 			"x-openai-target-path":  apiPath,
 			"x-openai-target-route": "/backend-api/conversation/{conversation_id}",
 		}).
 		Get(apiPath)
-	if err != nil {
-		return "", fmt.Errorf("获取对话失败: %w", err)
+	if respErr != nil {
+		return nil, "", false, fmt.Errorf("获取对话失败: %w", respErr)
 	}
 
 	var conv map[string]interface{}
-	if err := json.Unmarshal(resp.Bytes(), &conv); err != nil {
-		return "", fmt.Errorf("解析对话失败: %w", err)
+	if jsonErr := json.Unmarshal(resp.Bytes(), &conv); jsonErr != nil {
+		return nil, "", false, fmt.Errorf("解析对话失败: %w", jsonErr)
 	}
 
-	// 遍历所有 mapping 节点，找 multimodal_text 中的 image_asset_pointer
+	// current_node 是对话链末尾节点 ID，用于下轮对话的 parent_message_id
+	currentNode, _ = conv["current_node"].(string)
+
 	mapping, _ := conv["mapping"].(map[string]interface{})
+	seen := make(map[string]bool) // 去重：同一 file ID 可能出现在多个节点中
+
 	for _, nodeRaw := range mapping {
 		node, ok := nodeRaw.(map[string]interface{})
 		if !ok {
@@ -1039,6 +1070,26 @@ func (c *Client) fetchConversationImageFileID(conversationID string) (string, er
 		if ct, _ := content["content_type"].(string); ct != "multimodal_text" {
 			continue
 		}
+
+		// 检查该节点是否仍在生成中
+		isIntermediate := false
+		if meta, ok := msg["metadata"].(map[string]interface{}); ok {
+			if gr, ok := meta["ghostrider"].(map[string]interface{}); ok {
+				if grStatus, _ := gr["status"].(string); grStatus == "intermediate" {
+					isIntermediate = true
+				}
+			}
+			// is_temporal_turn=true 也表示异步还未完成
+			if isTemporal, _ := meta["is_temporal_turn"].(bool); isTemporal {
+				isIntermediate = true
+			}
+		}
+
+		if isIntermediate {
+			hasPending = true
+		}
+
+		// 收集所有 image_asset_pointer，去重处理
 		parts, _ := content["parts"].([]interface{})
 		for _, p := range parts {
 			part, _ := p.(map[string]interface{})
@@ -1046,10 +1097,26 @@ func (c *Client) fetchConversationImageFileID(conversationID string) (string, er
 				ptr, _ := part["asset_pointer"].(string)
 				if strings.HasPrefix(ptr, "sediment://") {
 					fileID := strings.TrimPrefix(ptr, "sediment://")
-					return fileID, nil
+					if !seen[fileID] {
+						seen[fileID] = true
+						fileIDs = append(fileIDs, fileID)
+					}
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("对话中未找到图片文件 ID")
+
+	return fileIDs, currentNode, hasPending, nil
+}
+
+// fetchConversationImageFileID 兼容旧调用，返回第一张图片的 file ID
+func (c *Client) fetchConversationImageFileID(conversationID string) (string, error) {
+	ids, _, _, err := c.fetchConversationImageFileIDs(conversationID)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("对话中未找到图片文件 ID")
+	}
+	return ids[0], nil
 }

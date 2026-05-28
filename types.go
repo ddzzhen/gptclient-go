@@ -16,13 +16,14 @@ type Config struct {
 
 // ChatResult 单轮对话结果
 type ChatResult struct {
-	Text               string // 助手回复的完整文本
-	ConversationID     string // 对话 ID
-	LastAssistantMsgID string // 最后一条助手消息 ID（用于多轮衔接）
-	ImageTaskID        string // DALL-E 图片任务触发标志（如有）
-	ImageFileID        string // 图片文件 ID（从 asset_pointer 提取，如 file_xxx）
-	ImagePath          string // 已下载图片本地路径（如有）
-	DalleStarted       bool   // 标记是否已输出正在画图的提示
+	Text               string   // 助手回复的完整文本
+	ConversationID     string   // 对话 ID
+	LastAssistantMsgID string   // 最后一条助手消息 ID（用于多轮衔接）
+	ImageTaskID        string   // DALL-E 图片任务触发标志（如有）
+	ImageFileID        string   // 首张图片文件 ID（兼容旧逻辑，等同于 ImageFileIDs[0]）
+	ImageFileIDs       []string // 所有生成图片的文件 ID 列表（多图场景）
+	ImagePath          string   // 已下载图片本地路径（如有）
+	DalleStarted       bool     // 标记是否已输出正在画图的提示
 }
 
 // SessionInfo 当前会话状态快照

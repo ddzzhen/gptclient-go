@@ -61,20 +61,39 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 		inputMsg = "[System]: " + systemPrompt + "\n\n" + userMsg
 	}
 
-	// 处理图片上传
+	// 处理文件上传（图片 + 文档 + 其他类型）
 	var uploadedImages []sentinel.UploadedFile
 	for _, b64 := range b64Images {
-		if strings.HasPrefix(b64, "data:image") {
-			parts := strings.SplitN(b64, ",", 2)
-			if len(parts) == 2 {
-				data, err := base64.StdEncoding.DecodeString(parts[1])
-				if err == nil {
-					uf, err := entry.client.UploadFile(c.Request.Context(), data, "")
-					if err == nil && uf != nil {
-						uploadedImages = append(uploadedImages, *uf)
-					}
-				}
-			}
+		// 解析 data URL：data:<mime>;base64,<data>  或  data:<mime>,<data>
+		if !strings.HasPrefix(b64, "data:") {
+			continue
+		}
+		commaIdx := strings.Index(b64, ",")
+		if commaIdx < 0 {
+			continue
+		}
+		header := b64[5:commaIdx]   // e.g. "application/pdf;base64" or "image/jpeg;base64"
+		payload := b64[commaIdx+1:] // base64 encoded data
+
+		var data []byte
+		var err error
+		if strings.Contains(header, ";base64") {
+			data, err = base64.StdEncoding.DecodeString(payload)
+		} else {
+			// 非 base64 编码（少见），直接用字节
+			data = []byte(payload)
+		}
+		if err != nil || len(data) == 0 {
+			continue
+		}
+
+		// 从 header 提取文件名后缀用于命名
+		mimeHint := strings.TrimSuffix(header, ";base64")
+		fileName := guessFileName(mimeHint)
+
+		uf, err := entry.client.UploadFile(c.Request.Context(), data, fileName)
+		if err == nil && uf != nil {
+			uploadedImages = append(uploadedImages, *uf)
 		}
 	}
 
@@ -182,20 +201,13 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		h.session.Register(registeredConvID, entry)
 	}
 
-	// 如果拿到文件ID，自动转换为内存穿透代理的URL
-	if result.ImageFileID != "" {
-		result.ImagePath = fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, result.ImageFileID)
-	}
-
-	if result.ImagePath != "" {
-		p := result.ImagePath
-		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
-			p = strings.ReplaceAll(p, "\\", "/")
-			if !strings.HasPrefix(p, "/") {
-				p = "/" + p
-			}
+	// 多图：为每个 file ID 生成代理 URL 并输出 markdown
+	if len(result.ImageFileIDs) > 0 {
+		var imgContent strings.Builder
+		for i, fileID := range result.ImageFileIDs {
+			proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, fileID)
+			imgContent.WriteString(fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, proxyURL))
 		}
-		imgMarkdown := fmt.Sprintf("\n\n![Generated Image](%s)", p)
 		imgChunk := ChatCompletionChunk{
 			ID:      chatID,
 			Object:  "chat.completion.chunk",
@@ -203,7 +215,42 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 			Model:   model,
 			Choices: []ChunkChoice{{
 				Index:        0,
-				Delta:        Delta{Content: imgMarkdown},
+				Delta:        Delta{Content: imgContent.String()},
+				FinishReason: nil,
+			}},
+		}
+		writeChunk(imgChunk)
+	} else if result.ImageFileID != "" {
+		// 兼容旧单图逻辑
+		proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, result.ImageFileID)
+		imgChunk := ChatCompletionChunk{
+			ID:      chatID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []ChunkChoice{{
+				Index:        0,
+				Delta:        Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", proxyURL)},
+				FinishReason: nil,
+			}},
+		}
+		writeChunk(imgChunk)
+	} else if result.ImagePath != "" {
+		p := result.ImagePath
+		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
+			p = strings.ReplaceAll(p, "\\", "/")
+			if !strings.HasPrefix(p, "/") {
+				p = "/" + p
+			}
+		}
+		imgChunk := ChatCompletionChunk{
+			ID:      chatID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []ChunkChoice{{
+				Index:        0,
+				Delta:        Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", p)},
 				FinishReason: nil,
 			}},
 		}
@@ -247,13 +294,19 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 		h.session.Register(result.ConversationID, entry)
 	}
 
-	// 如果拿到文件ID，自动转换为内存穿透代理的URL
-	if result.ImageFileID != "" {
-		result.ImagePath = fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, result.ImageFileID)
-	}
-
 	content := result.Text
-	if result.ImagePath != "" {
+
+	// 多图：为每个 file ID 生成代理 URL
+	if len(result.ImageFileIDs) > 0 {
+		for i, fileID := range result.ImageFileIDs {
+			proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, fileID)
+			content += fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, proxyURL)
+		}
+	} else if result.ImageFileID != "" {
+		// 兼容旧单图逻辑
+		proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, result.ImageFileID)
+		content += fmt.Sprintf("\n\n![Generated Image](%s)", proxyURL)
+	} else if result.ImagePath != "" {
 		p := result.ImagePath
 		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
 			p = strings.ReplaceAll(p, "\\", "/")
@@ -352,6 +405,31 @@ func (h *ChatHandler) HandleImageProxy(c *gin.Context) {
 	if err != nil {
 		c.String(http.StatusInternalServerError, "Proxy image failed: %v", err)
 	}
+}
+
+// guessFileName 根据 MIME 类型猜测一个合适的文件名
+func guessFileName(mime string) string {
+	extMap := map[string]string{
+		"image/jpeg":                                                          "upload.jpg",
+		"image/png":                                                           "upload.png",
+		"image/gif":                                                           "upload.gif",
+		"image/webp":                                                          "upload.webp",
+		"application/pdf":                                                     "document.pdf",
+		"application/msword":                                                  "document.doc",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document.docx",
+		"application/vnd.ms-excel":                                           "spreadsheet.xls",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":  "spreadsheet.xlsx",
+		"application/vnd.ms-powerpoint":                                      "presentation.ppt",
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation": "presentation.pptx",
+		"text/plain":                                                          "document.txt",
+		"text/csv":                                                            "data.csv",
+		"application/json":                                                    "data.json",
+		"text/markdown":                                                       "document.md",
+	}
+	if name, ok := extMap[mime]; ok {
+		return name
+	}
+	return "file"
 }
 
 // sizeToAspect 将 OpenAI 风格的 size 字符串转换为 ImageAspectRatio。
