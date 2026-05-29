@@ -51,6 +51,7 @@ func NewRouter(cfg *ServerConfig, pool *TokenPool, session *SessionManager) *gin
 
 	// ─── 管理前端与静态资源 ────────────────────────────────────────────────────────
 	r.GET("/api/image/proxy", chat.HandleImageProxy)
+	r.GET("/api/pdf/proxy", chat.HandlePDFProxy)
 	r.GET("/", HandleDashboard)
 	r.GET("/chat", HandleChatPage)
 	r.Static("/images", cfg.ImageDir)

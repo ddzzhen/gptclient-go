@@ -14,16 +14,27 @@ type Config struct {
 	TempMode     bool   // 可选：临时模式（不保存对话历史）
 }
 
+// ThinkStep 思考过程中的一个步骤（来自 textdocs API）
+type ThinkStep struct {
+	Summary string // 步骤标题（简短）
+	Content string // 详细推理内容
+}
+
 // ChatResult 单轮对话结果
 type ChatResult struct {
-	Text               string   // 助手回复的完整文本
-	ConversationID     string   // 对话 ID
-	LastAssistantMsgID string   // 最后一条助手消息 ID（用于多轮衔接）
-	ImageTaskID        string   // DALL-E 图片任务触发标志（如有）
-	ImageFileID        string   // 首张图片文件 ID（兼容旧逻辑，等同于 ImageFileIDs[0]）
-	ImageFileIDs       []string // 所有生成图片的文件 ID 列表（多图场景）
-	ImagePath          string   // 已下载图片本地路径（如有）
-	DalleStarted       bool     // 标记是否已输出正在画图的提示
+	Text               string        // 助手回复的完整文本
+	ThinkingText       string        // 思考过程文本（analysis channel，用于追踪增量）
+	ThinkSteps         []ThinkStep   // 思考步骤列表（含 summary + content 详细内容）
+	deltaChannel       string        // 内部：当前 delta 消息的 channel（analysis / final / ""）
+	seenThoughtKeys    map[string]bool // 内部：已推送过的 thought key（summary，去重用）
+	ConversationID     string        // 对话 ID
+	LastAssistantMsgID string        // 最后一条助手消息 ID（用于多轮衔接）
+	ImageTaskID        string        // DALL-E 图片任务触发标志（如有）
+	ImageFileID        string        // 首张图片文件 ID（兼容旧逻辑，等同于 ImageFileIDs[0]）
+	ImageFileIDs       []string      // 所有生成图片的文件 ID 列表（多图场景）
+	ImagePath          string        // 已下载图片本地路径（如有）
+	DalleStarted       bool          // 标记是否已输出正在画图的提示
+	PDFArtifacts       []PDFArtifact // Code Interpreter 生成的 PDF 列表（多 PDF 场景）
 }
 
 // SessionInfo 当前会话状态快照

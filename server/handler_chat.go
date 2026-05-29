@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -201,6 +202,24 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		h.session.Register(registeredConvID, entry)
 	}
 
+	// 思考步骤详细内容（textdocs API 获取，流结束后推送）
+	if len(result.ThinkSteps) > 0 {
+		var thinkContent strings.Builder
+		thinkContent.WriteString("\x00THINK_DETAILS\x00")
+		for i, step := range result.ThinkSteps {
+			if i > 0 {
+				thinkContent.WriteString("\x00STEP_SEP\x00")
+			}
+			thinkContent.WriteString(step.Summary)
+			thinkContent.WriteString("\x1F")
+			thinkContent.WriteString(step.Content)
+		}
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: thinkContent.String()}, FinishReason: nil}},
+		})
+	}
+
 	// 多图：为每个 file ID 生成代理 URL 并输出 markdown
 	if len(result.ImageFileIDs) > 0 {
 		var imgContent strings.Builder
@@ -255,6 +274,24 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 			}},
 		}
 		writeChunk(imgChunk)
+	}
+
+	// 多 PDF：输出下载链接
+	if len(result.PDFArtifacts) > 0 {
+		var pdfContent strings.Builder
+		for i, pdf := range result.PDFArtifacts {
+			proxyURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+				registeredConvID, pdf.MessageID, url.QueryEscape(pdf.SandboxPath))
+			label := pdf.FileName
+			if label == "" {
+				label = fmt.Sprintf("document_%d.pdf", i+1)
+			}
+			pdfContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, proxyURL))
+		}
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: pdfContent.String()}, FinishReason: nil}},
+		})
 	}
 
 	// 最后一个 chunk（stop）
@@ -315,6 +352,17 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 			}
 		}
 		content += fmt.Sprintf("\n\n![Generated Image](%s)", p)
+	}
+
+	// 多 PDF
+	for i, pdf := range result.PDFArtifacts {
+		proxyURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+			result.ConversationID, pdf.MessageID, url.QueryEscape(pdf.SandboxPath))
+		label := pdf.FileName
+		if label == "" {
+			label = fmt.Sprintf("document_%d.pdf", i+1)
+		}
+		content += fmt.Sprintf("\n\n[%s](%s)", label, proxyURL)
 	}
 
 	resp := ChatCompletionResponse{
@@ -404,6 +452,32 @@ func (h *ChatHandler) HandleImageProxy(c *gin.Context) {
 	err := entry.client.ProxyImageByFileID(fileID, convID, c.Writer, userAgent)
 	if err != nil {
 		c.String(http.StatusInternalServerError, "Proxy image failed: %v", err)
+	}
+}
+
+// HandlePDFProxy 代理下载 Code Interpreter 生成的 PDF
+func (h *ChatHandler) HandlePDFProxy(c *gin.Context) {
+	convID := c.Query("conv_id")
+	msgID := c.Query("msg_id")
+	sandboxPath := c.Query("sandbox_path")
+	if convID == "" || msgID == "" || sandboxPath == "" {
+		c.String(http.StatusBadRequest, "Missing conv_id, msg_id or sandbox_path")
+		return
+	}
+
+	entry, ok := h.session.GetSession(convID)
+	if !ok {
+		c.String(http.StatusNotFound, "Session not found or expired")
+		return
+	}
+
+	userAgent := c.GetHeader("User-Agent")
+	if userAgent == "" {
+		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+
+	if err := entry.client.ProxyPDFBySandboxPath(convID, msgID, sandboxPath, c.Writer, userAgent); err != nil {
+		c.String(http.StatusInternalServerError, "Proxy PDF failed: %v", err)
 	}
 }
 

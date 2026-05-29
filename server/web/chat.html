@@ -58,6 +58,20 @@ select option{background:var(--s2)}
 /* cursor blink */
 .cursor{display:inline-block;width:2px;height:1em;background:var(--text);margin-left:2px;animation:blink 1s step-end infinite;vertical-align:text-bottom}
 @keyframes blink{50%{opacity:0}}
+/* thinking block */
+.think-block{margin-bottom:.75rem;border-radius:10px;border:1px solid rgba(124,111,255,.25);background:rgba(124,111,255,.06);overflow:hidden}
+.think-header{display:flex;align-items:center;gap:7px;padding:.5rem .85rem;cursor:pointer;user-select:none;font-size:.8rem;color:var(--muted);font-weight:500;transition:background .15s}
+.think-header:hover{background:rgba(124,111,255,.1)}
+.think-spinner{width:14px;height:14px;border:2px solid rgba(124,111,255,.3);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+.think-done .think-spinner{display:none}
+.think-done .think-check{display:inline-block}
+.think-check{display:none;color:var(--accent);font-size:.9rem}
+.think-label{flex:1}
+.think-arrow{font-size:.7rem;transition:transform .2s}
+.think-block.open .think-arrow{transform:rotate(90deg)}
+.think-body{display:none;padding:.6rem .85rem .75rem;font-size:.78rem;color:var(--muted);line-height:1.65;border-top:1px solid rgba(124,111,255,.15);white-space:pre-wrap;max-height:320px;overflow-y:auto}
+.think-block.open .think-body{display:block}
+@keyframes spin{to{transform:rotate(360deg)}}
 /* welcome */
 .welcome{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted);gap:12px;text-align:center}
 .welcome-icon{font-size:3rem}
@@ -417,8 +431,131 @@ async function sendMessage() {
     }
 
     const reader = resp.body.getReader();
+    const THINK_MARK = '\x00THINK\x00';
+    const THINK_STEP_MARK = '\x00THINK_STEP\x00';
+    const THINK_DETAILS_MARK = '\x00THINK_DETAILS\x00';
+    const STEP_SEP = '\x00STEP_SEP\x00';
     const dec = new TextDecoder();
     let buf = '';
+    let thinkText = '';      // 累积思考内容
+    let thinkBlock = null;   // 思考框 DOM
+    let thinkBody = null;    // 思考框内容区 DOM
+
+    // 创建思考框（流式开始时插入气泡最前面）
+    function ensureThinkBlock() {
+      if (thinkBlock) return;
+      thinkBlock = document.createElement('div');
+      thinkBlock.className = 'think-block open';
+      thinkBlock.innerHTML = `
+        <div class="think-header" onclick="this.parentElement.classList.toggle('open')">
+          <div class="think-spinner"></div>
+          <span class="think-check">✓</span>
+          <span class="think-label">正在思考…</span>
+          <span class="think-arrow">›</span>
+        </div>
+        <div class="think-body"></div>`;
+      thinkBody = thinkBlock.querySelector('.think-body');
+      aiBubble.prepend(thinkBlock);
+    }
+
+    function updateThinkBlock(delta) {
+      ensureThinkBlock();
+      thinkText += delta;
+      thinkBody.textContent = thinkText;
+      thinkBody.scrollTop = thinkBody.scrollHeight;
+      scrollBottom();
+    }
+
+    function addThinkStep(payload) {
+      ensureThinkBlock();
+      // payload 格式: "标题\x1F执行输出" 或 "标题"
+      const sep = payload.indexOf('\x1F');
+      const title = sep >= 0 ? payload.slice(0, sep) : payload;
+      const detail = sep >= 0 ? payload.slice(sep + 1) : '';
+
+      const step = document.createElement('div');
+      step.style.cssText = 'border-bottom:1px solid rgba(255,255,255,.04);padding:5px 0;';
+
+      if (detail) {
+        // 有详情：可展开的步骤
+        step.innerHTML = `
+          <div onclick="this.parentElement.classList.toggle('step-open')" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.76rem;color:var(--muted);">
+            <span class="step-arrow" style="color:var(--accent);font-size:.7rem;transition:transform .15s;">›</span>
+            <span>${escHtml(title)}</span>
+          </div>
+          <div class="step-detail" style="display:none;margin-top:5px;padding:6px 8px;background:rgba(0,0,0,.25);border-radius:6px;font-size:.72rem;color:#a0a0c0;white-space:pre-wrap;max-height:200px;overflow-y:auto;line-height:1.55;">${escHtml(detail)}</div>`;
+        // CSS toggle via class
+        step.addEventListener('click', function(e) {
+          if (e.target.tagName === 'DIV' || e.target.tagName === 'SPAN') {
+            const detail = this.querySelector('.step-detail');
+            const arrow = this.querySelector('.step-arrow');
+            if (detail) {
+              const isOpen = detail.style.display !== 'none';
+              detail.style.display = isOpen ? 'none' : 'block';
+              if (arrow) arrow.style.transform = isOpen ? '' : 'rotate(90deg)';
+            }
+          }
+        });
+      } else {
+        step.innerHTML = `<div style="display:flex;align-items:center;gap:6px;font-size:.76rem;color:var(--muted);">
+          <span style="color:var(--accent);font-size:.7rem;">›</span><span>${escHtml(title)}</span></div>`;
+      }
+
+      thinkBody.appendChild(step);
+      thinkBody.scrollTop = thinkBody.scrollHeight;
+      scrollBottom();
+    }
+
+    // applyThinkDetails：用 textdocs API 返回的完整思考步骤替换当前思考框内容
+    function applyThinkDetails(payload) {
+      if (!payload) return;
+      ensureThinkBlock();
+      // 清空旧步骤（来自 reasoning_title 的粗略版本）
+      thinkBody.innerHTML = '';
+      // payload 格式: "summary1\x1Fcontent1\x00STEP_SEP\x00summary2\x1Fcontent2..."
+      const stepsRaw = payload.split(STEP_SEP);
+      for (const raw of stepsRaw) {
+        if (!raw) continue;
+        const sep = raw.indexOf('\x1F');
+        const summary = sep >= 0 ? raw.slice(0, sep) : raw;
+        const content = sep >= 0 ? raw.slice(sep + 1) : '';
+        const step = document.createElement('div');
+        step.style.cssText = 'border-bottom:1px solid rgba(255,255,255,.04);padding:5px 0;';
+        if (content) {
+          step.innerHTML = `
+            <div onclick="this.parentElement.classList.toggle('step-open')" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.76rem;color:var(--muted);">
+              <span class="step-arrow" style="color:var(--accent);font-size:.7rem;transition:transform .15s;">›</span>
+              <span>${escHtml(summary)}</span>
+            </div>
+            <div class="step-detail" style="display:none;margin-top:5px;padding:6px 8px;background:rgba(0,0,0,.25);border-radius:6px;font-size:.72rem;color:#a0a0c0;white-space:pre-wrap;max-height:200px;overflow-y:auto;line-height:1.55;">${escHtml(content)}</div>`;
+          step.addEventListener('click', function(e) {
+            if (e.target.tagName === 'DIV' || e.target.tagName === 'SPAN') {
+              const det = this.querySelector('.step-detail');
+              const arrow = this.querySelector('.step-arrow');
+              if (det) {
+                const isOpen = det.style.display !== 'none';
+                det.style.display = isOpen ? 'none' : 'block';
+                if (arrow) arrow.style.transform = isOpen ? '' : 'rotate(90deg)';
+              }
+            }
+          });
+        } else {
+          step.innerHTML = `<div style="display:flex;align-items:center;gap:6px;font-size:.76rem;color:var(--muted);">
+            <span style="color:var(--accent);font-size:.7rem;">›</span><span>${escHtml(summary)}</span></div>`;
+        }
+        thinkBody.appendChild(step);
+      }
+    }
+
+    function finalizeThinkBlock(elapsed) {
+      if (!thinkBlock) return;
+      thinkBlock.classList.add('think-done');
+      thinkBlock.classList.remove('open'); // 思考结束后折叠
+      const label = thinkBlock.querySelector('.think-label');
+      if (label) label.textContent = elapsed ? `已思考 ${elapsed}` : '已完成思考';
+    }
+
+    const thinkStart = Date.now();
 
     while (true) {
       const { done, value } = await reader.read();
@@ -445,7 +582,22 @@ async function sendMessage() {
             document.getElementById('conv-id-display').textContent = convID;
           }
           const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
+          if (!delta) continue;
+
+          // 分离思考内容和正文
+          if (delta.startsWith(THINK_DETAILS_MARK)) {
+            // 流结束后收到的完整思考详情（textdocs API），替换已有步骤
+            applyThinkDetails(delta.slice(THINK_DETAILS_MARK.length));
+          } else if (delta.startsWith(THINK_STEP_MARK)) {
+            addThinkStep(delta.slice(THINK_STEP_MARK.length));
+          } else if (delta.startsWith(THINK_MARK)) {
+            updateThinkBlock(delta.slice(THINK_MARK.length));
+          } else {
+            // 收到正文时，若有思考框则标记完成并折叠
+            if (thinkBlock && !thinkBlock.classList.contains('think-done')) {
+              const elapsed = ((Date.now() - thinkStart) / 1000).toFixed(0) + 's';
+              finalizeThinkBlock(elapsed);
+            }
             fullText += delta;
             if (imageMode) {
               // 图片模式：只在收到 markdown 图片链接时才更新气泡，过滤中间文字
@@ -458,8 +610,15 @@ async function sendMessage() {
               }
             } else {
               cursor.remove();
-              aiBubble.innerHTML = formatText(fullText);
-              aiBubble.appendChild(cursor);
+              // 保留思考框，只更新正文部分
+              const textNode = aiBubble.querySelector('.think-reply') || (() => {
+                const d = document.createElement('div');
+                d.className = 'think-reply';
+                aiBubble.appendChild(d);
+                return d;
+              })();
+              textNode.innerHTML = formatText(fullText);
+              textNode.appendChild(cursor);
               scrollBottom();
             }
           }
@@ -470,6 +629,11 @@ async function sendMessage() {
     aiBubble.textContent = '❌ 请求失败：' + e.message;
   } finally {
     cursor.remove();
+    // 结束时标记思考完成
+    if (thinkBlock && !thinkBlock.classList.contains('think-done')) {
+      const elapsed = ((Date.now() - thinkStart) / 1000).toFixed(0) + 's';
+      finalizeThinkBlock(elapsed);
+    }
     // 图片模式：如果最终没有图片，显示纯文字内容（可能有错误信息）
     if (imageMode) {
       const imgMatch = fullText.match(/!\[[^\]]*\]\([^)]+\)/g);
@@ -478,7 +642,7 @@ async function sendMessage() {
       } else if (!fullText) {
         aiBubble.textContent = '（生成失败，无内容返回）';
       }
-    } else if (!fullText) {
+    } else if (!fullText && !thinkText) {
       aiBubble.textContent = '（无内容）';
     }
     isStreaming = false;
@@ -510,12 +674,19 @@ function appendMessage(role, text, rawHtml = '') {
 }
 
 function formatText(text) {
-  // 简单格式化：代码块 + 内联代码 + 图片
+  // 过滤掉思考标记（防止混入正文）
+  text = text.replace(/\x00THINK_DETAILS\x00[\s\S]*/g, '').replace(/\x00THINK_STEP\x00[^\n]*/g, '').replace(/\x00THINK\x00/g, '');
+  // 简单格式化：代码块 + 内联代码 + 图片 + 链接
   return text
     .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
       `<pre><code>${escHtml(code.trimEnd())}</code></pre>`)
     .replace(/`([^`]+)`/g, (_, c) => `<code>${escHtml(c)}</code>`)
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<br><img src="$2" alt="$1" style="max-width:100%; border-radius:8px; margin-top:10px;"><br>')
+    .replace(/\[([^\]]+)\]\((\/api\/pdf\/proxy[^)]+)\)/g, (_, label, href) => {
+      const safeName = escHtml(label);
+      const safeHref = escHtml(href);
+      return `<br><a href="${safeHref}" download="${safeName}" target="_blank" style="display:inline-flex;align-items:center;gap:6px;padding:6px 14px;background:rgba(124,111,255,.15);border:1px solid rgba(124,111,255,.35);border-radius:8px;color:#a99fff;text-decoration:none;font-size:.82rem;margin-top:8px;">📄 ${safeName}</a><br>`;
+    })
     .replace(/\n/g, '<br>');
 }
 

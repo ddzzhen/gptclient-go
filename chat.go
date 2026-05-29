@@ -181,6 +181,35 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 		}
 	}
 
+	// PDF 生成场景：轮询 conversation 中的 sandbox PDF 路径
+	if shouldPollPDF(opts.Text, result.Text) && result.ConversationID != "" && len(result.ImageFileIDs) == 0 {
+		c.logf("[pdf-poll] 开始轮询 PDF 生成进度, conversation=%s", result.ConversationID)
+		if pdfs, lastMsgID, err := c.pollPDFStreamStatus(result.ConversationID); err != nil {
+			c.logf("[pdf-poll] 轮询失败: %v", err)
+		} else {
+			result.PDFArtifacts = pdfs
+			if lastMsgID != "" {
+				result.LastAssistantMsgID = lastMsgID
+				c.parentMessageID = lastMsgID
+			}
+			c.logf("[pdf-poll] PDF 已就绪: %d 个, %v", len(pdfs), pdfNames(pdfs))
+		}
+	}
+	if len(result.PDFArtifacts) > 0 {
+		result.Text = ""
+	}
+
+	// 思考模型：获取思考步骤详细内容（textdocs API）
+	if result.ConversationID != "" {
+		c.logf("[textdocs] 获取思考步骤详细内容, conversation=%s", result.ConversationID)
+		if steps, err := c.fetchTextdocs(result.ConversationID); err != nil {
+			c.logf("[textdocs] 获取失败（非致命）: %v", err)
+		} else if len(steps) > 0 {
+			result.ThinkSteps = steps
+			c.logf("[textdocs] 获取到 %d 个思考步骤", len(steps))
+		}
+	}
+
 	return result, nil
 }
 
@@ -319,7 +348,7 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 			continue
 		}
 
-		if strings.Contains(payload, "dalle") || strings.Contains(payload, `"tool"`) || strings.Contains(payload, "image") {
+		if strings.Contains(payload, "dalle") || strings.Contains(payload, `"tool"`) || strings.Contains(payload, "image") || strings.Contains(payload, "thought") || strings.Contains(payload, "reasoning_content") {
 			c.logf("[debug-sse] payload: %s", payload)
 		}
 
@@ -433,17 +462,12 @@ func (c *Client) processConvUpdatePayload(payload map[string]interface{}, result
 		parts, _ := msgContent["parts"].([]interface{})
 
 		if channel == "analysis" {
-			hasText := false
 			for _, part := range parts {
 				if text, ok := part.(string); ok && text != "" {
 					if handler != nil {
 						handler(text)
 					}
-					hasText = true
 				}
-			}
-			if hasText && handler != nil {
-				handler("\n")
 			}
 			continue
 		}
@@ -847,9 +871,17 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 	// 格式 A：顶层 append patch
 	if pPath == "/message/content/parts/0" && pOp == "append" {
 		if text, ok := evt["v"].(string); ok && text != "" {
-			*lastText += text
-			if handler != nil {
-				handler(text)
+			// 判断当前 channel 是否是思考（由上层 add 初始化时记录）
+			if result.deltaChannel == "analysis" {
+				result.ThinkingText += text
+				if handler != nil {
+					handler("\x00THINK\x00" + text)
+				}
+			} else {
+				*lastText += text
+				if handler != nil {
+					handler(text)
+				}
 			}
 		}
 		return
@@ -862,9 +894,16 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 	_, hasO := evt["o"]
 	if !hasP && !hasO {
 		if text, ok := v.(string); ok && text != "" {
-			*lastText += text
-			if handler != nil {
-				handler(text)
+			if result.deltaChannel == "analysis" {
+				result.ThinkingText += text
+				if handler != nil {
+					handler("\x00THINK\x00" + text)
+				}
+			} else {
+				*lastText += text
+				if handler != nil {
+					handler(text)
+				}
 			}
 			return
 		}
@@ -880,6 +919,17 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 
 				if author == "assistant" && msgID != "" {
 					result.LastAssistantMsgID = msgID
+					// 记录当前消息的 channel，供后续 append patch 使用
+					result.deltaChannel = channel
+
+					// content_type="thoughts"：解析思考步骤（summary + content）
+					if content, ok := msg["content"].(map[string]interface{}); ok {
+						if ct, _ := content["content_type"].(string); ct == "thoughts" {
+							if thoughts, ok := content["thoughts"].([]interface{}); ok {
+								c.extractThoughts(thoughts, result, handler)
+							}
+						}
+					}
 				}
 				if author == "tool" {
 					if meta, ok := msg["metadata"].(map[string]interface{}); ok {
@@ -890,6 +940,27 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 						if result.ImageTaskID == "" {
 							if _, ok := meta["ghostrider"]; ok {
 								result.ImageTaskID = "ghostrider"
+							}
+						}
+						// 思考模型：reasoning_title 是每步工具调用的思考标题
+						if title, ok := meta["reasoning_title"].(string); ok && title != "" {
+							// 同时取 content.parts[0] 作为执行输出
+							execOutput := ""
+							if content, ok := msg["content"].(map[string]interface{}); ok {
+								if text, ok := content["text"].(string); ok {
+									execOutput = text
+								} else if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
+									if s, ok := parts[0].(string); ok {
+										execOutput = s
+									}
+								}
+							}
+							if handler != nil {
+								payload := title
+								if execOutput != "" {
+									payload += "\x1F" + execOutput // \x1F 单元分隔符
+								}
+								handler("\x00THINK_STEP\x00" + payload)
 							}
 						}
 					}
@@ -916,9 +987,16 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 				po, _ := patch["o"].(string)
 				if pp == "/message/content/parts/0" && po == "append" {
 					if text, ok := patch["v"].(string); ok && text != "" {
-						*lastText += text
-						if handler != nil {
-							handler(text)
+						if result.deltaChannel == "analysis" {
+							result.ThinkingText += text
+							if handler != nil {
+								handler("\x00THINK\x00" + text)
+							}
+						} else {
+							*lastText += text
+							if handler != nil {
+								handler(text)
+							}
 						}
 					}
 				}
@@ -939,25 +1017,73 @@ func (c *Client) processFullSSE(evt map[string]interface{}, result *ChatResult, 
 	}
 
 	author := getNestedString(msg, "author", "role")
+	channel, _ := msg["channel"].(string)
 	msgID, _ := msg["id"].(string)
 
 	if author == "assistant" && msgID != "" {
 		result.LastAssistantMsgID = msgID
+
+		// content_type="thoughts"：解析思考步骤（summary + content）
+		if content, ok := msg["content"].(map[string]interface{}); ok {
+			if ct, _ := content["content_type"].(string); ct == "thoughts" {
+				if thoughts, ok := content["thoughts"].([]interface{}); ok {
+					c.extractThoughts(thoughts, result, handler)
+				}
+			}
+		}
 	}
 
 	if meta, ok := msg["metadata"].(map[string]interface{}); ok {
 		if tid, ok := meta["image_gen_task_id"].(string); ok && tid != "" {
 			result.ImageTaskID = tid
 		}
+		// 思考模型：tool 消息中的 reasoning_title 是每步思考标题
+		if author == "tool" {
+			if title, ok := meta["reasoning_title"].(string); ok && title != "" {
+				execOutput := ""
+				if content, ok := msg["content"].(map[string]interface{}); ok {
+					if text, ok := content["text"].(string); ok {
+						execOutput = text
+					} else if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
+						if s, ok := parts[0].(string); ok {
+							execOutput = s
+						}
+					}
+				}
+				if handler != nil {
+					payload := title
+					if execOutput != "" {
+						payload += "\x1F" + execOutput
+					}
+					handler("\x00THINK_STEP\x00" + payload)
+				}
+			}
+		}
 	}
 
 	if author == "assistant" {
-		if text := getFirstStringPart(msg); text != "" && len(text) > len(*lastText) {
-			delta := text[len(*lastText):]
-			if handler != nil {
-				handler(delta)
+		text := getFirstStringPart(msg)
+		if text == "" {
+			return
+		}
+		if channel == "analysis" {
+			// 思考过程：增量发送，用 lastThinkText 追踪已发量
+			if len(text) > len(result.ThinkingText) {
+				delta := text[len(result.ThinkingText):]
+				result.ThinkingText = text
+				if handler != nil {
+					handler("\x00THINK\x00" + delta)
+				}
 			}
-			*lastText = text
+		} else {
+			// 正文（含 final）
+			if len(text) > len(*lastText) {
+				delta := text[len(*lastText):]
+				if handler != nil {
+					handler(delta)
+				}
+				*lastText = text
+			}
 		}
 	}
 }
@@ -1119,4 +1245,130 @@ func (c *Client) fetchConversationImageFileID(conversationID string) (string, er
 		return "", fmt.Errorf("对话中未找到图片文件 ID")
 	}
 	return ids[0], nil
+}
+
+// fetchTextdocs 调用 textdocs API 获取思考步骤的详细内容
+// textdocs 返回一个对象数组，每个对象包含 type、thought（含 summary/content）等字段
+func (c *Client) fetchTextdocs(conversationID string) ([]ThinkStep, error) {
+	apiPath := "/backend-api/conversation/" + conversationID + "/textdocs"
+	resp, err := c.httpClient.R().
+		SetHeaders(map[string]string{
+			"x-openai-target-path":  apiPath,
+			"x-openai-target-route": "/backend-api/conversation/{conversation_id}/textdocs",
+		}).
+		Get(apiPath)
+	if err != nil {
+		return nil, fmt.Errorf("textdocs 请求失败: %w", err)
+	}
+	if resp.IsErrorState() {
+		return nil, fmt.Errorf("textdocs 返回错误: status=%d body=%s", resp.StatusCode, resp.String()[:min(200, len(resp.String()))])
+	}
+
+	// textdocs 返回格式：{"textdocs": [{"type": 0, "thought": {"summary": "...", "content": "...", ...}}, ...]}
+	// 或直接是数组
+	rawBody := resp.String()
+	c.logf("[textdocs] 原始响应 status=%d len=%d snippet=%s", resp.StatusCode, len(rawBody), rawBody[:min(500, len(rawBody))])
+
+	var rawData interface{}
+	if err := json.Unmarshal(resp.Bytes(), &rawData); err != nil {
+		return nil, fmt.Errorf("textdocs 解析失败: %w", err)
+	}
+
+	var chunks []interface{}
+	switch v := rawData.(type) {
+	case map[string]interface{}:
+		// 可能是 {"textdocs": [...]} 或 {"chunks": [...]}
+		for _, key := range []string{"textdocs", "chunks", "items", "data"} {
+			if arr, ok := v[key].([]interface{}); ok {
+				chunks = arr
+				break
+			}
+		}
+		if chunks == nil {
+			c.logf("[textdocs] 未知顶层结构, keys=%v", mapKeys(v))
+		}
+	case []interface{}:
+		chunks = v
+	}
+
+	var steps []ThinkStep
+	for _, chunkRaw := range chunks {
+		chunk, ok := chunkRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// type=0 是思考段落
+		chunkType, _ := chunk["type"].(float64)
+		if int(chunkType) != 0 {
+			continue
+		}
+		thought, ok := chunk["thought"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		summary, _ := thought["summary"].(string)
+		content, _ := thought["content"].(string)
+		if summary == "" && content == "" {
+			continue
+		}
+		steps = append(steps, ThinkStep{
+			Summary: summary,
+			Content: content,
+		})
+	}
+	return steps, nil
+}
+
+// extractThoughts 从 content_type="thoughts" 消息的 thoughts 数组中提取已完成的思考步骤。
+// SSE 流中的数组元素格式：{"summary": "...", "content": "...", "chunks": [...], "finished": true}
+// 每个 finished=true 的步骤通过 \x00THINK_STEP\x00 标记推送一次（summary\x1Fcontent），去重处理。
+func (c *Client) extractThoughts(thoughts []interface{}, result *ChatResult, handler StreamHandler) {
+	if result.seenThoughtKeys == nil {
+		result.seenThoughtKeys = make(map[string]bool)
+	}
+	for _, tRaw := range thoughts {
+		t, ok := tRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// SSE 格式：直接包含 summary, content, finished
+		finished, _ := t["finished"].(bool)
+		if !finished {
+			continue
+		}
+		summary, _ := t["summary"].(string)
+		content, _ := t["content"].(string)
+		if summary == "" {
+			continue
+		}
+		// 去重：同一个 summary 只推送一次
+		if result.seenThoughtKeys[summary] {
+			continue
+		}
+		result.seenThoughtKeys[summary] = true
+		result.ThinkSteps = append(result.ThinkSteps, ThinkStep{Summary: summary, Content: content})
+		c.logf("[thoughts] 新思考步骤: %s", summary)
+		if handler != nil {
+			payload := summary
+			if content != "" {
+				payload += "\x1F" + content
+			}
+			handler("\x00THINK_STEP\x00" + payload)
+		}
+	}
+}
+
+func mapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
