@@ -34,14 +34,22 @@ type Message struct {
 
 // ContentPart 多模态内容项
 type ContentPart struct {
-	Type     string    `json:"type"` // "text" | "image_url"
+	Type     string    `json:"type"` // "text" | "image_url" | "file"
 	Text     string    `json:"text,omitempty"`
 	ImageURL *ImageURL `json:"image_url,omitempty"`
+	File     *FilePart `json:"file,omitempty"` // type=file 时使用
 }
 
 // ImageURL 图片链接或 Base64
 type ImageURL struct {
 	URL string `json:"url"` // 形如 "data:image/jpeg;base64,..." 或普通 URL
+}
+
+// FilePart 文件类型内容（对应 OpenAI type=file）
+type FilePart struct {
+	FileID   string `json:"file_id,omitempty"`   // 预上传的 file_id 引用
+	Filename string `json:"filename,omitempty"`  // 文件名（配合 file_data 使用）
+	FileData string `json:"file_data,omitempty"` // base64 编码的文件内容（data: URL 格式）
 }
 
 // ─── 非流式响应 ───────────────────────────────────────────────────────────────
@@ -61,9 +69,10 @@ type ChatCompletionResponse struct {
 
 // Choice 非流式选项
 type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason string  `json:"finish_reason"`
+	Index            int     `json:"index"`
+	Message          Message `json:"message"`
+	FinishReason     string  `json:"finish_reason"`
+	ReasoningContent string  `json:"reasoning_content,omitempty"` // 思考内容（兼容 DeepSeek 风格）
 }
 
 // Usage token 用量（ChatGPT 逆向无法精确统计，用 0 占位）

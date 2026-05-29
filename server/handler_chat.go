@@ -65,32 +65,38 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 	// 处理文件上传（图片 + 文档 + 其他类型）
 	var uploadedImages []sentinel.UploadedFile
 	for _, b64 := range b64Images {
-		// 解析 data URL：data:<mime>;base64,<data>  或  data:<mime>,<data>
-		if !strings.HasPrefix(b64, "data:") {
-			continue
-		}
-		commaIdx := strings.Index(b64, ",")
-		if commaIdx < 0 {
-			continue
-		}
-		header := b64[5:commaIdx]   // e.g. "application/pdf;base64" or "image/jpeg;base64"
-		payload := b64[commaIdx+1:] // base64 encoded data
-
 		var data []byte
+		var fileName string
 		var err error
-		if strings.Contains(header, ";base64") {
-			data, err = base64.StdEncoding.DecodeString(payload)
+
+		if strings.HasPrefix(b64, "http://") || strings.HasPrefix(b64, "https://") {
+			// HTTP/HTTPS URL：先下载再上传
+			data, fileName, err = downloadURL(b64)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+		} else if strings.HasPrefix(b64, "data:") {
+			// 解析 data URL：data:<mime>;base64,<data>  或  data:<mime>,<data>
+			commaIdx := strings.Index(b64, ",")
+			if commaIdx < 0 {
+				continue
+			}
+			header := b64[5:commaIdx]   // e.g. "application/pdf;base64" or "image/jpeg;base64"
+			payload := b64[commaIdx+1:] // base64 encoded data
+
+			if strings.Contains(header, ";base64") {
+				data, err = base64.StdEncoding.DecodeString(payload)
+			} else {
+				data = []byte(payload)
+			}
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			mimeHint := strings.TrimSuffix(header, ";base64")
+			fileName = guessFileName(mimeHint)
 		} else {
-			// 非 base64 编码（少见），直接用字节
-			data = []byte(payload)
-		}
-		if err != nil || len(data) == 0 {
 			continue
 		}
-
-		// 从 header 提取文件名后缀用于命名
-		mimeHint := strings.TrimSuffix(header, ";base64")
-		fileName := guessFileName(mimeHint)
 
 		uf, err := entry.client.UploadFile(c.Request.Context(), data, fileName)
 		if err == nil && uf != nil {
@@ -220,40 +226,23 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		})
 	}
 
-	// 多图：为每个 file ID 生成代理 URL 并输出 markdown
+	// 多图：为每个 file ID 生成代理 URL 并输出 markdown（绝对路径）
 	if len(result.ImageFileIDs) > 0 {
 		var imgContent strings.Builder
 		for i, fileID := range result.ImageFileIDs {
-			proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, fileID)
-			imgContent.WriteString(fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, proxyURL))
+			relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, fileID)
+			imgContent.WriteString(fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, buildAbsoluteURL(c, h.cfg, relURL)))
 		}
-		imgChunk := ChatCompletionChunk{
-			ID:      chatID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []ChunkChoice{{
-				Index:        0,
-				Delta:        Delta{Content: imgContent.String()},
-				FinishReason: nil,
-			}},
-		}
-		writeChunk(imgChunk)
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: imgContent.String()}, FinishReason: nil}},
+		})
 	} else if result.ImageFileID != "" {
-		// 兼容旧单图逻辑
-		proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, result.ImageFileID)
-		imgChunk := ChatCompletionChunk{
-			ID:      chatID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []ChunkChoice{{
-				Index:        0,
-				Delta:        Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", proxyURL)},
-				FinishReason: nil,
-			}},
-		}
-		writeChunk(imgChunk)
+		relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, result.ImageFileID)
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, relURL))}, FinishReason: nil}},
+		})
 	} else if result.ImagePath != "" {
 		p := result.ImagePath
 		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
@@ -262,31 +251,23 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 				p = "/" + p
 			}
 		}
-		imgChunk := ChatCompletionChunk{
-			ID:      chatID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []ChunkChoice{{
-				Index:        0,
-				Delta:        Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", p)},
-				FinishReason: nil,
-			}},
-		}
-		writeChunk(imgChunk)
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, p))}, FinishReason: nil}},
+		})
 	}
 
-	// 多 PDF：输出下载链接
+	// 多 PDF：输出下载链接（绝对路径）
 	if len(result.PDFArtifacts) > 0 {
 		var pdfContent strings.Builder
 		for i, pdf := range result.PDFArtifacts {
-			proxyURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+			relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
 				registeredConvID, pdf.MessageID, url.QueryEscape(pdf.SandboxPath))
 			label := pdf.FileName
 			if label == "" {
 				label = fmt.Sprintf("document_%d.pdf", i+1)
 			}
-			pdfContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, proxyURL))
+			pdfContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL)))
 		}
 		writeChunk(ChatCompletionChunk{
 			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
@@ -333,16 +314,15 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 
 	content := result.Text
 
-	// 多图：为每个 file ID 生成代理 URL
+	// 多图：为每个 file ID 生成代理 URL（绝对路径）
 	if len(result.ImageFileIDs) > 0 {
 		for i, fileID := range result.ImageFileIDs {
-			proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, fileID)
-			content += fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, proxyURL)
+			relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, fileID)
+			content += fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, buildAbsoluteURL(c, h.cfg, relURL))
 		}
 	} else if result.ImageFileID != "" {
-		// 兼容旧单图逻辑
-		proxyURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, result.ImageFileID)
-		content += fmt.Sprintf("\n\n![Generated Image](%s)", proxyURL)
+		relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, result.ImageFileID)
+		content += fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, relURL))
 	} else if result.ImagePath != "" {
 		p := result.ImagePath
 		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
@@ -351,18 +331,33 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 				p = "/" + p
 			}
 		}
-		content += fmt.Sprintf("\n\n![Generated Image](%s)", p)
+		content += fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, p))
 	}
 
-	// 多 PDF
+	// 多 PDF（绝对路径）
 	for i, pdf := range result.PDFArtifacts {
-		proxyURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+		relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
 			result.ConversationID, pdf.MessageID, url.QueryEscape(pdf.SandboxPath))
 		label := pdf.FileName
 		if label == "" {
 			label = fmt.Sprintf("document_%d.pdf", i+1)
 		}
-		content += fmt.Sprintf("\n\n[%s](%s)", label, proxyURL)
+		content += fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL))
+	}
+
+	// 非流式响应：收集思考内容到 reasoning_content
+	reasoningContent := ""
+	if len(result.ThinkSteps) > 0 {
+		var sb strings.Builder
+		for i, step := range result.ThinkSteps {
+			if i > 0 {
+				sb.WriteString("\n\n")
+			}
+			fmt.Fprintf(&sb, "**%s**\n%s", step.Summary, step.Content)
+		}
+		reasoningContent = sb.String()
+	} else if result.ThinkingText != "" {
+		reasoningContent = result.ThinkingText
 	}
 
 	resp := ChatCompletionResponse{
@@ -371,9 +366,10 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 		Created: created,
 		Model:   model,
 		Choices: []Choice{{
-			Index:        0,
-			Message:      Message{Role: "assistant", Content: content},
-			FinishReason: "stop",
+			Index:            0,
+			Message:          Message{Role: "assistant", Content: content},
+			FinishReason:     "stop",
+			ReasoningContent: reasoningContent,
 		}},
 		Usage:          Usage{},
 		ConversationID: result.ConversationID,
@@ -397,13 +393,20 @@ func parseMessageContent(c interface{}) (text string, images []string) {
 					if txt, ok := m["text"].(string); ok {
 						text += txt
 					}
-				} else if t == "image_url" {
-					if imgUrl, ok := m["image_url"].(map[string]interface{}); ok {
-						if url, ok := imgUrl["url"].(string); ok {
-							images = append(images, url)
-						}
+			} else if t == "image_url" {
+				if imgUrl, ok := m["image_url"].(map[string]interface{}); ok {
+					if url, ok := imgUrl["url"].(string); ok {
+						images = append(images, url)
 					}
 				}
+			} else if t == "file" {
+				if filePart, ok := m["file"].(map[string]interface{}); ok {
+					if fileData, ok := filePart["file_data"].(string); ok && fileData != "" {
+						// data:application/pdf;base64,... 格式，直接复用 data URL 通道
+						images = append(images, fileData)
+					}
+				}
+			}
 			}
 		}
 	}
@@ -504,6 +507,63 @@ func guessFileName(mime string) string {
 		return name
 	}
 	return "file"
+}
+
+// downloadURL 下载 HTTP/HTTPS URL 的内容，返回字节数据和推断的文件名
+func downloadURL(rawURL string) ([]byte, string, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("download %s: %w", rawURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("download %s: HTTP %d", rawURL, resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read body %s: %w", rawURL, err)
+	}
+
+	// 从 Content-Type 推断文件名
+	contentType := resp.Header.Get("Content-Type")
+	mimeType := strings.Split(contentType, ";")[0]
+	mimeType = strings.TrimSpace(mimeType)
+	fileName := guessFileName(mimeType)
+
+	// 如果 URL 末尾有文件名，也可以用它
+	if fileName == "file" {
+		if idx := strings.LastIndex(rawURL, "/"); idx >= 0 {
+			candidate := rawURL[idx+1:]
+			// 去掉 query string
+			if qIdx := strings.Index(candidate, "?"); qIdx >= 0 {
+				candidate = candidate[:qIdx]
+			}
+			if strings.Contains(candidate, ".") {
+				fileName = candidate
+			}
+		}
+	}
+	return data, fileName, nil
+}
+
+// buildAbsoluteURL 将相对路径转换为绝对 URL
+// 优先使用 cfg.BaseURL，其次从请求头推断
+func buildAbsoluteURL(c *gin.Context, cfg *ServerConfig, path string) string {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
+	}
+	if cfg.BaseURL != "" {
+		base := strings.TrimRight(cfg.BaseURL, "/")
+		return base + path
+	}
+	scheme := "http"
+	if c.GetHeader("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	host := c.Request.Host
+	return scheme + "://" + host + path
 }
 
 // sizeToAspect 将 OpenAI 风格的 size 字符串转换为 ImageAspectRatio。

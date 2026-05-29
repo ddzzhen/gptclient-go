@@ -24,6 +24,11 @@ type ServerConfig struct {
 
 	// Session 管理
 	SessionTTLMinutes int // Session 不活跃超时（分钟），默认 120
+
+	// 对外地址（可选），用于生成绝对资源链接（图片/PDF 代理 URL）
+	// 例如：http://192.168.1.10:5005 或 https://your.domain
+	// 若为空，则从请求的 Host / X-Forwarded-Proto 头自动推断
+	BaseURL string
 }
 
 // LoadConfig 从环境变量加载配置
@@ -36,6 +41,7 @@ func LoadConfig() ServerConfig {
 		ImageDir:          getEnv("IMAGE_DIR", "images"),
 		TokensFile:        getEnv("TOKENS_FILE", "tokens.txt"),
 		SessionTTLMinutes: getEnvInt("SESSION_TTL_MINUTES", 120),
+		BaseURL:           getEnv("BASE_URL", ""),
 	}
 }
 
