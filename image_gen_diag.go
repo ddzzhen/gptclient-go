@@ -39,19 +39,16 @@ func (result *ChatResult) ImageGenExitBlockReason() string {
 		return fmt.Sprintf("blocking=async_pending(%d,active=%v) idleSinceImg=%.1fs", result.imageAsyncTaskPending, result.imageAsyncTaskActive, since.Seconds())
 	}
 	need := ImageGenIdleDuration(result)
-	if result.imageGenAsyncCompleteSeen {
+	if result.imageGenAsyncCompleteSeen || result.imageGenConvAsyncStatusDone {
 		need = 3 * time.Second
 		if since < need {
-			return fmt.Sprintf("blocking=post_complete_idle(%.1fs/%.0fs)", since.Seconds(), need.Seconds())
+			return fmt.Sprintf("blocking=post_complete_idle(%.1fs/%.0fs convStatus=%v)",
+				since.Seconds(), need.Seconds(), result.imageGenConvAsyncStatusDone)
 		}
 		return "ok"
 	}
 	if result.imageGenTurnDone {
-		need = 5 * time.Second
-		if since < need {
-			return fmt.Sprintf("blocking=post_turn_done_idle(%.1fs/%.0fs)", since.Seconds(), need.Seconds())
-		}
-		return "ok"
+		return fmt.Sprintf("blocking=turn_done_but_async_may_continue idleSinceImg=%.1fs", since.Seconds())
 	}
 	if since < need {
 		return fmt.Sprintf("blocking=idle_wait(%.1fs/%.0fs)", since.Seconds(), need.Seconds())
@@ -81,6 +78,9 @@ func summarizeConvUpdatePayload(payload map[string]interface{}) string {
 	if msgs, ok := uc["messages"].([]interface{}); ok {
 		parts = append(parts, fmt.Sprintf("msgs=%d", len(msgs)))
 	}
+	if st, ok := uc["conversation_async_status"].(float64); ok {
+		parts = append(parts, fmt.Sprintf("async_status=%d", int(st)))
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -92,10 +92,10 @@ func (c *Client) logImageGenDiag(result *ChatResult, tag string) {
 	if result.lastImageGenActivityAt > 0 {
 		sinceImg = time.Since(time.Unix(0, result.lastImageGenActivityAt)).Seconds()
 	}
-	c.logf("[image-ws][diag] %s pending=%d active=%v complete=%v turnDone=%v slots=%d dalle=%v idleSinceImg=%.1fs block=%s",
+	c.logf("[image-ws][diag] %s pending=%d active=%v complete=%v convStatus=%v turnDone=%v slots=%d dalle=%v idleSinceImg=%.1fs block=%s",
 		tag,
 		result.imageAsyncTaskPending, result.imageAsyncTaskActive,
-		result.imageGenAsyncCompleteSeen, result.imageGenTurnDone,
+		result.imageGenAsyncCompleteSeen, result.imageGenConvAsyncStatusDone, result.imageGenTurnDone,
 		len(result.imageSlots), result.HasDalleGeneratedOutput(), sinceImg,
 		result.ImageGenExitBlockReason(),
 	)

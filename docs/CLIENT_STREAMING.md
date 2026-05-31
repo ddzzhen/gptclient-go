@@ -514,11 +514,19 @@ go run ./cmd/stream-capture/ -config config.json -case image
 - 有图且 **20s** 无新图、仍无 `complete` 时自动 `stale pending` 清除
 - 服务端日志前缀：`[image-ws][evt]` / `[async]` / `[img]` / `[diag]`，`block=` 说明为何还不能结束
 
+结束信号（按优先级）：
+
+1. `set-conversation-async-status` 且 `conversation_async_status=4`（网页端生图完成时常有）
+2. `async-task-complete` / `end` 等
+3. 最后一**张新图**后 idle 15～25s（`add-messages` 重复推送不会刷新 idle）
+
+注意：`turn [DONE]` 只表示 turn 正文流结束，**不等于**生图结束。
+
 示例：
 
 ```text
-[image-ws] 等待生图中... 已等待 83s | blocking=async_pending(1,active=true) idleSinceImg=12.3s
-[image-ws][async] 长期无 complete，已清除 stale pending（有图且 idle≥20s）
+[image-ws][async] set-conversation-async-status status=4
+[image-ws] 生图收齐 2 槽（... convStatus=true）
 [image-ws][diag] exit_ok ... block=ok
 ```
 

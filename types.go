@@ -48,8 +48,9 @@ type ChatResult struct {
 	imageSlots             map[string]*GeneratedImageSlot
 	imageAsyncTaskActive      bool // 仍有进行中的 image_gen async task
 	imageAsyncTaskPending     int  // async-task-start 与 complete/end 计数
-	imageGenAsyncCompleteSeen bool // 已收到 async-task-complete/end
-	imageGenTurnDone          bool // turn topic WS 流已 [DONE]
+	imageGenAsyncCompleteSeen    bool // 已收到 async-task-complete/end
+	imageGenConvAsyncStatusDone  bool // set-conversation-async-status（如 status=4）
+	imageGenTurnDone             bool // turn topic WS 流已 [DONE]（仅诊断，不单独作为结束条件）
 }
 
 // SessionInfo 当前会话状态快照

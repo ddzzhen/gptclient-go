@@ -344,12 +344,11 @@ func (result *ChatResult) CanImageGenIdleExit() bool {
 		return false
 	}
 	since := time.Since(time.Unix(0, result.lastImageGenActivityAt))
-	if result.imageGenAsyncCompleteSeen {
+	// 服务端明确完成（async-task-complete 或 set-conversation-async-status=4）
+	if result.imageGenAsyncCompleteSeen || result.imageGenConvAsyncStatusDone {
 		return since >= 3*time.Second
 	}
-	if result.imageGenTurnDone {
-		return since >= 5*time.Second
-	}
+	// 不用 turnDone：正文流 [DONE] 常早于生图 conversation-update 结束
 	return since >= ImageGenIdleDuration(result)
 }
 

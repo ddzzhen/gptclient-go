@@ -487,7 +487,7 @@ func (c *Client) trackImageAsyncTaskUpdate(result *ChatResult, updateType string
 	if result == nil || updateType == "" || !isImageAsyncWSUpdate(updateType) {
 		return
 	}
-	c.bumpImageGenActivity(result)
+	// 不在此处 bump：add-messages 刷屏会导致 idle 永不满足；仅在新 file_id 修订时 bump
 	switch updateType {
 	case "async-task-start":
 		result.imageAsyncTaskPending++
@@ -509,10 +509,33 @@ func (c *Client) trackImageAsyncTaskUpdate(result *ChatResult, updateType string
 	}
 }
 
+// handleSetConversationAsyncStatus 网页端生图结束时常见：conversation_async_status=4（见 testdata ws.ndjson）。
+func (c *Client) handleSetConversationAsyncStatus(payload map[string]interface{}, result *ChatResult) {
+	uc, _ := payload["update_content"].(map[string]interface{})
+	status := -1
+	switch v := uc["conversation_async_status"].(type) {
+	case float64:
+		status = int(v)
+	case int:
+		status = v
+	}
+	c.logf("[image-ws][async] set-conversation-async-status status=%d", status)
+	// 抓包中完成态为 4；其它值仅记录，避免误判
+	if status == 4 {
+		result.imageGenConvAsyncStatusDone = true
+		result.imageGenAsyncCompleteSeen = true
+		result.imageAsyncTaskPending = 0
+		result.imageAsyncTaskActive = false
+	}
+}
+
 // processConvUpdatePayload 处理 conversation-update 的 payload（生图可多图，不在此结束 WS）。
 func (c *Client) processConvUpdatePayload(payload map[string]interface{}, result *ChatResult, opts ChatOptions, handler StreamHandler) {
 	result.ExpectGeneratedImages = IsGeneratedImageTurn(result.ArtifactSignals, opts)
 	updateType, _ := payload["update_type"].(string)
+	if updateType == "set-conversation-async-status" {
+		c.handleSetConversationAsyncStatus(payload, result)
+	}
 	c.trackImageAsyncTaskUpdate(result, updateType)
 	summary := summarizeConvUpdatePayload(payload)
 	if summary != "" {
@@ -679,9 +702,9 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 		if result.CanImageGenIdleExit() {
 			idle := ImageGenIdleDuration(result)
 			c.FinishImageGenWS(result, opts)
-			c.logf("[image-ws] 生图收齐 %d 槽（idle %.0fs pending=%d active=%v complete=%v turnDone=%v）",
-				len(result.imageSlots), idle.Seconds(), result.imageAsyncTaskPending, result.imageAsyncTaskActive,
-				result.imageGenAsyncCompleteSeen, result.imageGenTurnDone)
+			c.logf("[image-ws] 生图收齐 %d 槽（idle %.0fs pending=%d complete=%v convStatus=%v）",
+				len(result.imageSlots), idle.Seconds(), result.imageAsyncTaskPending,
+				result.imageGenAsyncCompleteSeen, result.imageGenConvAsyncStatusDone)
 			c.logImageGenDiag(result, "exit_ok")
 			return nil
 		}
