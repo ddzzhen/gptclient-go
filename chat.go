@@ -33,6 +33,8 @@ type ChatOptions struct {
 	ForcePictureV2 bool
 	// ImageAspect 仅在 ForcePictureV2=true 时生效，指定生成图片的宽高比
 	ImageAspect ImageAspectRatio
+	// Artifacts 产物（生图/沙箱文件）流式侧信道；正文仍走 StreamHandler
+	Artifacts ArtifactStreamConfig
 }
 
 // Chat 发送一轮对话，返回完整结果（非流式）
@@ -159,7 +161,7 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 	}
 	c.logf("[step 3] 发送对话: model=%s, conversation=%s, turn=%d", c.model, convDesc, c.turnCount+1)
 
-	result, err := c.streamConversation(body, sentinelToken, proofToken, conduitToken, turnTraceID, wsConn, handler)
+	result, err := c.streamConversation(body, opts, sentinelToken, proofToken, conduitToken, turnTraceID, wsConn, handler)
 	if err != nil {
 		return nil, err
 	}
@@ -172,42 +174,23 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 	}
 	c.turnCount++
 
-	c.logf("[info] conversation_id=%s, turn=%d, reply=%d字",
-		c.conversationID, c.turnCount, len([]rune(result.Text)))
-
-	if !c.DisableAutoImage && (result.ImageFileID == "" && result.DalleStarted) {
-		if fid, err := c.PollForImageFileID(result.ConversationID); err == nil {
-			result.ImageFileID = fid
-		}
+	c.logf("[info] conversation_id=%s, turn=%d, reply=%d字, thinking=%d字, final=%d字",
+		c.conversationID, c.turnCount,
+		len([]rune(result.Text)),
+		len([]rune(result.ThinkingText)),
+		len([]rune(result.assistantFinalText)))
+	LogContentPreview(c.logf, "reply-text", result.Text)
+	if result.ThinkingText != "" && result.ThinkingText != result.Text {
+		LogContentPreview(c.logf, "reply-thinking", result.ThinkingText)
 	}
 
-	// PDF 生成场景：轮询 conversation 中的 sandbox PDF 路径
-	if shouldPollPDF(opts.Text, result.Text) && result.ConversationID != "" && len(result.ImageFileIDs) == 0 {
-		c.logf("[pdf-poll] 开始轮询 PDF 生成进度, conversation=%s", result.ConversationID)
-		if pdfs, lastMsgID, err := c.pollPDFStreamStatus(result.ConversationID); err != nil {
-			c.logf("[pdf-poll] 轮询失败: %v", err)
-		} else {
-			result.PDFArtifacts = pdfs
-			if lastMsgID != "" {
-				result.LastAssistantMsgID = lastMsgID
-				c.parentMessageID = lastMsgID
-			}
-			c.logf("[pdf-poll] PDF 已就绪: %d 个, %v", len(pdfs), pdfNames(pdfs))
-		}
-	}
-	if len(result.PDFArtifacts) > 0 {
+	c.MergeApplyAndEmitArtifacts(result, opts)
+	if len(result.SandboxArtifacts) > 0 {
+		c.logf("[artifact] SSE 沙箱产物: %v", sandboxNames(result.SandboxArtifacts))
 		result.Text = ""
 	}
-
-	// 思考模型：获取思考步骤详细内容（textdocs API）
-	if result.ConversationID != "" {
-		c.logf("[textdocs] 获取思考步骤详细内容, conversation=%s", result.ConversationID)
-		if steps, err := c.fetchTextdocs(result.ConversationID); err != nil {
-			c.logf("[textdocs] 获取失败（非致命）: %v", err)
-		} else if len(steps) > 0 {
-			result.ThinkSteps = steps
-			c.logf("[textdocs] 获取到 %d 个思考步骤", len(steps))
-		}
+	if result.ExpectGeneratedImages && len(result.ImageFileIDs) > 0 {
+		c.logf("[artifact] 生图 file_id: %v", result.ImageFileIDs)
 	}
 
 	return result, nil
@@ -286,7 +269,7 @@ func nextWsID() int64 {
 }
 
 // streamConversation 发 f/conversation，解析 stream_handoff 后走 WebSocket 续流
-func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken, conduitToken, turnTraceID string, wsConn *websocket.Conn, handler StreamHandler) (*ChatResult, error) {
+func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinelToken, proofToken, conduitToken, turnTraceID string, wsConn *websocket.Conn, handler StreamHandler) (*ChatResult, error) {
 	headers := map[string]string{
 		"Accept":       "text/event-stream",
 		"Content-Type": "application/json",
@@ -348,6 +331,12 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 			continue
 		}
 
+		if c.StreamRecorder != nil {
+			c.StreamRecorder.RecordSSE(currentEvent, payload, evt)
+		}
+		result.ArtifactSignals = MergeSignals(result.ArtifactSignals, ExtractSignalsFromJSON(evt))
+		c.MergeApplyAndEmitArtifacts(result, opts)
+
 		if strings.Contains(payload, "dalle") || strings.Contains(payload, `"tool"`) || strings.Contains(payload, "image") || strings.Contains(payload, "thought") || strings.Contains(payload, "reasoning_content") {
 			c.logf("[debug-sse] payload: %s", payload)
 		}
@@ -368,12 +357,26 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 			}
 			currentEvent = ""
 			continue
+		case "server_ste_metadata":
+			if handoffTopicID == "" {
+				if md, ok := evt["metadata"].(map[string]interface{}); ok {
+					if tid, ok := md["turn_exchange_id"].(string); ok && tid != "" {
+						handoffTopicID = "conversation-turn-" + tid
+					}
+				}
+			}
+			currentEvent = ""
+			continue
 		}
 
-		// server_ste_metadata 事件（生图/思考场景）：提取 turn_exchange_id（备用）
-		if currentEvent == "server_ste_metadata" {
-			if tid, ok := evt["turn_exchange_id"].(string); ok && tid != "" && handoffTopicID == "" {
+		// 兼容 event: server_ste_metadata + data 内无 type 字段的旧格式
+		if currentEvent == "server_ste_metadata" && handoffTopicID == "" {
+			if tid, ok := evt["turn_exchange_id"].(string); ok && tid != "" {
 				handoffTopicID = "conversation-turn-" + tid
+			} else if md, ok := evt["metadata"].(map[string]interface{}); ok {
+				if tid, ok := md["turn_exchange_id"].(string); ok && tid != "" {
+					handoffTopicID = "conversation-turn-" + tid
+				}
 			}
 		}
 
@@ -386,37 +389,44 @@ func (c *Client) streamConversation(body interface{}, sentinelToken, proofToken,
 		currentEvent = ""
 	}
 
-	// 图片生成场景：即使已有文本（如"正在处理图片"提示），也必须继续等待 WebSocket 图片
-	if !c.DisableAutoImage && result.ImageTaskID != "" && result.ConversationID != "" {
-		// 图片生成场景：使用 HTTP 轮询 stream_status，比 WebSocket 更可靠
-		c.logf("[image-poll] 开始轮询图片生成进度, conversation=%s", result.ConversationID)
-		if fileIDs, lastMsgID, err := c.pollImageStreamStatus(result.ConversationID); err != nil {
-			c.logf("[image-poll] 轮询失败: %v", err)
-		} else {
-			result.ImageFileIDs = fileIDs
-			if len(fileIDs) > 0 {
-				result.ImageFileID = fileIDs[0]
-			}
-			// 用图片生成后对话链的最后节点 ID 作为下轮 parent_message_id，确保多轮对话连续
-			if lastMsgID != "" {
-				result.LastAssistantMsgID = lastMsgID
-				c.logf("[image-poll] 更新 parentMsgID=%s", lastMsgID)
-			}
-			c.logf("[image-poll] 图片已就绪: %d 张, IDs=%v", len(fileIDs), fileIDs)
-		}
-	} else if handoffTopicID != "" && wsConn != nil {
-		// 普通文字场景走 topic SSE 续流
+	c.MergeApplyAndEmitArtifacts(result, opts)
+	// 仅当 final 通道正文已完整时才跳过 WS catchup（避免未出 JSON 就 handoff）
+	result.bodyStreamFromSSE = result.assistantFinalText != ""
+
+	if handoffTopicID != "" && wsConn != nil {
 		c.logf("[handoff] 订阅 WebSocket topic: %s", handoffTopicID)
-		if err := c.subscribeWSStream(wsConn, handoffTopicID, result, &lastText, handler); err != nil {
+		var err error
+		// 生图：WS 内继续收 delta / conversation-update，直到出现 image_asset_pointer（不轮询 conversation API）
+		if !c.DisableAutoImage && result.ExpectGeneratedImages && result.ImageTaskID != "" {
+			err = c.subscribeWSImageCombined(wsConn, handoffTopicID, result.ConversationID, result, opts, &lastText, handler)
+		} else {
+			err = c.subscribeWSStream(wsConn, handoffTopicID, result, opts, &lastText, handler)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("ws stream: %w", err)
+		}
+		c.MergeApplyAndEmitArtifacts(result, opts)
+		if result.ExpectGeneratedImages {
+			if result.HasDalleGeneratedOutput() {
+				c.logf("[artifact] 生图 file_id: %v", result.ImageFileIDs)
+			} else if len(result.ImageFileIDs) > 0 {
+				c.logf("[image-ws] 无 DALL·E 产出（勿将用户参考图 file_id 当作生图结果）: %v", result.ImageFileIDs)
+			} else if result.imageAsyncTaskActive {
+				c.logf("[image-ws] async 生图任务已启动但 WS 未收到带 gen_id 的图片更新")
+			}
 		}
 	}
 
-	// 图片生成成功后清除排队提示文字，只保留图片 URL
-	if len(result.ImageFileIDs) > 0 {
+	// 生图成功且有 DALL·E 产出时清除排队提示文字
+	if result.ExpectGeneratedImages && result.HasDalleGeneratedOutput() {
 		lastText = ""
+		result.assistantFinalText = ""
 	}
-	result.Text = lastText
+	if result.assistantFinalText != "" {
+		result.Text = result.assistantFinalText
+	} else {
+		result.Text = lastText
+	}
 	return result, nil
 }
 
@@ -439,83 +449,110 @@ func parseWSFrames(raw []byte) []map[string]interface{} {
 	return []map[string]interface{}{single}
 }
 
-// processConvUpdatePayload 处理 conversation-update 的 payload：输出 analysis 文字，若发现图片则写入 result.ImageFileID 并返回 true
-func (c *Client) processConvUpdatePayload(payload map[string]interface{}, result *ChatResult, handler StreamHandler) bool {
+// processConvUpdatePayload 处理 conversation-update 的 payload（生图可多图，不在此结束 WS）。
+func (c *Client) processConvUpdatePayload(payload map[string]interface{}, result *ChatResult, opts ChatOptions, handler StreamHandler) {
+	result.ExpectGeneratedImages = IsGeneratedImageTurn(result.ArtifactSignals, opts)
+	updateType, _ := payload["update_type"].(string)
+	if updateType == "async-task-start" {
+		result.imageAsyncTaskActive = true
+	}
 	updateContent, ok := payload["update_content"].(map[string]interface{})
 	if !ok {
-		return false
+		return
+	}
+	if msg, ok := updateContent["message"].(map[string]interface{}); ok {
+		c.processConvUpdateMessage(msg, result, opts, handler, updateType)
+		return
 	}
 	messages, ok := updateContent["messages"].([]interface{})
 	if !ok {
-		return false
+		return
 	}
-
 	for _, msgI := range messages {
 		msg, ok := msgI.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		author, _ := msg["author"].(map[string]interface{})
-		role, _ := author["role"].(string)
-		channel, _ := msg["channel"].(string)
-		msgContent, _ := msg["content"].(map[string]interface{})
-		parts, _ := msgContent["parts"].([]interface{})
+		c.processConvUpdateMessage(msg, result, opts, handler, updateType)
+	}
+}
 
-		if channel == "analysis" {
-			for _, part := range parts {
-				if text, ok := part.(string); ok && text != "" {
-					if handler != nil {
-						handler(text)
-					}
-				}
-			}
-			continue
+// FinishImageGenWS 生图 WS 结束或 HTTP 收尾：定稿各槽位并刷新 ImageFileIDs。
+func (c *Client) FinishImageGenWS(result *ChatResult, opts ChatOptions) {
+	if result == nil || !result.ExpectGeneratedImages {
+		return
+	}
+	c.FinalizeImageGenSlots(result, opts)
+	result.RebuildImageFileIDsFromSlots()
+}
+
+func (c *Client) processConvUpdateMessage(msg map[string]interface{}, result *ChatResult, opts ChatOptions, handler StreamHandler, wsUpdateType string) {
+	msgID, _ := msg["id"].(string)
+	if result.ExpectGeneratedImages {
+		for _, img := range parseGeneratedImagesFromMessage(msg) {
+			c.logf("[image-ws] %s slot gen=%s file=%s rev_path", wsUpdateType, img.GenID, img.FileID)
+			c.noteGeneratedImageRevision(result, opts, img, wsUpdateType)
 		}
-
-		if role == "tool" {
-			name, _ := author["name"].(string)
-			status, _ := msg["status"].(string)
-
-			isImageTool := strings.Contains(name, "dalle") || strings.Contains(name, "image_gen")
-
-			if isImageTool && status == "in_progress" {
-				if handler != nil && !result.DalleStarted {
-					prompt := ""
-					for _, p := range parts {
-						if pStr, ok := p.(string); ok && pStr != "" {
-							prompt += pStr
+		if meta, ok := msg["metadata"].(map[string]interface{}); ok {
+			if refs, ok := meta["content_references"].([]interface{}); ok {
+				for _, refRaw := range refs {
+					ref, _ := refRaw.(map[string]interface{})
+					if ap, _ := ref["asset_pointer"].(string); ap != "" {
+						if fileID := extractFileID(ap); fileID != "" {
+							c.logf("[image-ws] content_reference asset: %s", fileID)
+							c.noteGeneratedImageRevision(result, opts, ParsedGeneratedImage{
+								FileID: fileID, MessageID: msgID,
+							}, wsUpdateType)
 						}
-					}
-					if prompt != "" {
-						handler(fmt.Sprintf("\n\n[正在生成图片: %s...]\n\n", prompt))
-					} else {
-						handler("\n\n[正在生成图片，请稍候...]\n\n")
-					}
-					result.DalleStarted = true
-				}
-			}
-
-			for _, part := range parts {
-				partMap, ok := part.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				if partMap["content_type"] == "image_asset_pointer" {
-					assetPtr, _ := partMap["asset_pointer"].(string)
-					if fileID := strings.TrimPrefix(assetPtr, "sediment://"); fileID != assetPtr && fileID != "" {
-						c.logf("[image-ws] 收到图片 asset_pointer: %s", fileID)
-						result.ImageFileID = fileID
-						return true
 					}
 				}
 			}
 		}
 	}
-	return false
+	author, _ := msg["author"].(map[string]interface{})
+	role, _ := author["role"].(string)
+	channel, _ := msg["channel"].(string)
+	msgContent, _ := msg["content"].(map[string]interface{})
+	parts, _ := msgContent["parts"].([]interface{})
+
+	if channel == "analysis" {
+		for _, part := range parts {
+			if text, ok := part.(string); ok && text != "" {
+				if handler != nil {
+					handler(text)
+				}
+			}
+		}
+		return
+	}
+
+	if role == "tool" {
+		name, _ := author["name"].(string)
+		status, _ := msg["status"].(string)
+		isImageTool := strings.Contains(name, "dalle") || strings.Contains(name, "image_gen")
+		if isImageTool && status == "in_progress" && !result.DalleStarted {
+			title := "正在生成图片，请稍候..."
+			for _, p := range parts {
+				if pStr, ok := p.(string); ok && pStr != "" {
+					title = "正在生成图片: " + pStr
+					break
+				}
+			}
+			opts.Artifacts.normalized().emit(StreamEvent{
+				Event: StreamEventArtifactPending,
+				Kind:  "generated_image",
+				Title: title,
+			})
+			if handler != nil {
+				handler("\n\n[" + title + "...]\n\n")
+			}
+			result.DalleStarted = true
+		}
+	}
 }
 
 // subscribeWSImageCombined 生图：订阅 conversation-turn-* 消费流式 delta，同时处理 conversation-update 拿图片
-func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, conversationID string, result *ChatResult, lastText *string, handler StreamHandler) error {
+func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, conversationID string, result *ChatResult, opts ChatOptions, lastText *string, handler StreamHandler) error {
 	subID := nextWsID()
 	subMsg := []map[string]interface{}{
 		{"id": subID, "command": map[string]interface{}{
@@ -558,9 +595,23 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 	conn.SetReadDeadline(time.Now().Add(readDeadlineExt))
 	defer conn.SetReadDeadline(time.Time{})
 
-	for result.ImageFileID == "" {
+	waitStart := time.Now()
+	lastProgress := time.Now()
+	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("超过最大等待时间 %.0f 分钟，图片未返回", totalTimeout.Minutes())
+		}
+		idle := ImageGenIdleDuration(result)
+		if result.HasDalleGeneratedOutput() && result.lastImageAddedAt > 0 {
+			if time.Since(time.Unix(0, result.lastImageAddedAt)) >= idle {
+				c.FinishImageGenWS(result, opts)
+				c.logf("[image-ws] 生图收齐 %d 槽（idle %.0fs）", len(result.imageSlots), idle.Seconds())
+				return nil
+			}
+		}
+		if time.Since(lastProgress) >= 15*time.Second {
+			c.logf("[image-ws] 等待 picture file_id 中... 已等待 %ds", int(time.Since(waitStart).Seconds()))
+			lastProgress = time.Now()
 		}
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -569,6 +620,7 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 		conn.SetReadDeadline(time.Now().Add(readDeadlineExt))
 
 		frames := parseWSFrames(raw)
+		c.logAndRecordWSFrames(raw, frames)
 		for _, frame := range frames {
 			fType, _ := frame["type"].(string)
 			switch fType {
@@ -580,9 +632,7 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 				if cid, _ := payload["conversation_id"].(string); cid != conversationID {
 					continue
 				}
-				if c.processConvUpdatePayload(payload, result, handler) {
-					return nil
-				}
+				c.processConvUpdatePayload(payload, result, opts, handler)
 			case "reply":
 				reply, ok := frame["reply"].(map[string]interface{})
 				if !ok {
@@ -593,10 +643,14 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 					continue
 				}
 				catchups, _ := reply["catchups"].([]interface{})
-				c.logf("[ws] reply catchups=%d", len(catchups))
-				for _, cu := range catchups {
-					if msg, ok := cu.(map[string]interface{}); ok {
-						_ = c.processWSMessage(msg, result, lastText, handler, &useDeltaEncoding, &currentEvent)
+				if result.bodyStreamFromSSE {
+					c.logf("[ws] skip catchups=%d (final body already from HTTP SSE)", len(catchups))
+				} else {
+					c.logf("[ws] reply catchups=%d", len(catchups))
+					for _, cu := range catchups {
+						if msg, ok := cu.(map[string]interface{}); ok {
+							c.processWSMessage(msg, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
+						}
 					}
 				}
 			case "message":
@@ -604,15 +658,44 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 				if frameTopic != turnTopicID {
 					continue
 				}
-				_ = c.processWSMessage(frame, result, lastText, handler, &useDeltaEncoding, &currentEvent)
+				c.processWSMessage(frame, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
 			}
 		}
+		c.MergeApplyAndEmitArtifacts(result, opts)
 	}
-	return nil
+}
+
+func imageFileIDSeen(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+// logAndRecordWSFrames 打印并可选落盘 WebSocket 帧（stream-capture 写 ws.ndjson）。
+func (c *Client) logAndRecordWSFrames(raw []byte, frames []map[string]interface{}) {
+	rawStr := string(raw)
+	hasImg := strings.Contains(rawStr, "sediment://") || strings.Contains(rawStr, "image_asset_pointer")
+	if len(frames) == 0 {
+		c.logf("[ws-frame] (unparsed) raw_len=%d has_image_ref=%v", len(raw), hasImg)
+		if c.StreamRecorder != nil {
+			c.StreamRecorder.RecordWS("", raw)
+		}
+		return
+	}
+	for _, frame := range frames {
+		fType, _ := frame["type"].(string)
+		c.logf("[ws-frame] type=%s raw_len=%d has_image_ref=%v", fType, len(raw), hasImg)
+		if c.StreamRecorder != nil {
+			c.StreamRecorder.RecordWS(fType, raw)
+		}
+	}
 }
 
 // subscribeWSStream 通过已有 WebSocket 连接订阅 topic 并消费 encoded_item 里的 SSE 数据
-func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result *ChatResult, lastText *string, handler StreamHandler) error {
+func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result *ChatResult, opts ChatOptions, lastText *string, handler StreamHandler) error {
 	subID := nextWsID()
 	subMsg := []map[string]interface{}{
 		{"id": subID, "command": map[string]interface{}{
@@ -658,13 +741,23 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 					continue
 				}
 				catchups, _ := reply["catchups"].([]interface{})
-				c.logf("[ws] reply catchups=%d", len(catchups))
-				for _, cu := range catchups {
-					if msg, ok := cu.(map[string]interface{}); ok {
-						d := c.processWSMessage(msg, result, lastText, handler, &useDeltaEncoding, &currentEvent)
-						if d {
-							done = true
+				if result.bodyStreamFromSSE && !result.ExpectGeneratedImages {
+					c.logf("[ws] skip catchups=%d (final body already from HTTP SSE)", len(catchups))
+					done = true
+				} else {
+					c.logf("[ws] reply catchups=%d", len(catchups))
+					for _, cu := range catchups {
+						if msg, ok := cu.(map[string]interface{}); ok {
+							d := c.processWSMessage(msg, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
+							if d {
+								done = true
+							}
 						}
+					}
+					// catchup 含完整流但无 [DONE] 标记时，正文已到齐即可结束
+					if !done && result.assistantFinalText != "" {
+						c.logf("[ws] catchups done, final len=%d", len([]rune(result.assistantFinalText)))
+						done = true
 					}
 				}
 				continue
@@ -675,8 +768,10 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 				if frameTopic != topicID {
 					continue
 				}
-				d := c.processWSMessage(frame, result, lastText, handler, &useDeltaEncoding, &currentEvent)
+				d := c.processWSMessage(frame, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
 				if d {
+					done = true
+				} else if result.assistantFinalText != "" {
 					done = true
 				}
 			}
@@ -688,7 +783,7 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 
 // subscribeWSConvUpdate 监听 WebSocket 的 conversation-update 消息（生图场景，无 turn topic 时）
 // 通过定期 Ping 心跳保活连接，最长等待 10 分钟。
-func (c *Client) subscribeWSConvUpdate(conn *websocket.Conn, conversationID string, result *ChatResult, handler StreamHandler) error {
+func (c *Client) subscribeWSConvUpdate(conn *websocket.Conn, conversationID string, result *ChatResult, opts ChatOptions, handler StreamHandler) error {
 	const totalTimeout = 10 * time.Minute
 	const pingInterval = 25 * time.Second
 	const readDeadlineExt = 60 * time.Second
@@ -726,6 +821,13 @@ func (c *Client) subscribeWSConvUpdate(conn *websocket.Conn, conversationID stri
 		if time.Now().After(deadline) {
 			return fmt.Errorf("超过最大等待时间 %.0f 分钟，图片未返回", totalTimeout.Minutes())
 		}
+		idle := ImageGenIdleDuration(result)
+		if result.HasDalleGeneratedOutput() && result.lastImageAddedAt > 0 {
+			if time.Since(time.Unix(0, result.lastImageAddedAt)) >= idle {
+				c.FinishImageGenWS(result, opts)
+				return nil
+			}
+		}
 
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -744,15 +846,14 @@ func (c *Client) subscribeWSConvUpdate(conn *websocket.Conn, conversationID stri
 			if cid, _ := payload["conversation_id"].(string); cid != conversationID {
 				continue
 			}
-			if c.processConvUpdatePayload(payload, result, handler) {
-				return nil
-			}
+			c.processConvUpdatePayload(payload, result, opts, handler)
 		}
+		c.MergeApplyAndEmitArtifacts(result, opts)
 	}
 }
 
 // processWSMessage 处理单条 WebSocket message 帧，返回 true 表示流结束
-func (c *Client) processWSMessage(frame map[string]interface{}, result *ChatResult, lastText *string, handler StreamHandler, useDeltaEncoding *bool, currentEvent *string) bool {
+func (c *Client) processWSMessage(frame map[string]interface{}, result *ChatResult, opts ChatOptions, lastText *string, handler StreamHandler, useDeltaEncoding *bool, currentEvent *string) bool {
 	payload1, ok := frame["payload"].(map[string]interface{})
 	if !ok {
 		return false
@@ -794,6 +895,8 @@ func (c *Client) processWSMessage(frame map[string]interface{}, result *ChatResu
 			*currentEvent = ""
 			continue
 		}
+		result.ArtifactSignals = MergeSignals(result.ArtifactSignals, ExtractSignalsFromJSON(evt))
+		c.MergeApplyAndEmitArtifacts(result, opts)
 
 		if cid, ok := evt["conversation_id"].(string); ok && cid != "" {
 			result.ConversationID = cid
@@ -858,6 +961,100 @@ func checkImageTaskID(evt map[string]interface{}, result *ChatResult) {
 	}
 }
 
+func (result *ChatResult) noteAssistantChannel(channel string) {
+	if channel == "analysis" {
+		result.sawAnalysisChannel = true
+	}
+	if channel != "" {
+		result.deltaChannel = channel
+	}
+}
+
+func (result *ChatResult) isAnalysisStream() bool {
+	if result.deltaChannel == "analysis" {
+		return true
+	}
+	return result.deltaChannel == "" && result.sawAnalysisChannel
+}
+
+func (c *Client) emitThinkingDelta(result *ChatResult, text string, handler StreamHandler) {
+	if text == "" {
+		return
+	}
+	result.ThinkingText += text
+	if handler != nil {
+		handler("\x00THINK\x00" + text)
+	}
+}
+
+func (result *ChatResult) shouldSkipImageGenToolBodyDelta(text string) bool {
+	if !result.ExpectGeneratedImages {
+		return false
+	}
+	if result.deltaChannel == "commentary" {
+		return true
+	}
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	// ImageGen 工具参数 JSON 碎片（勿下发给客户端）
+	if strings.HasPrefix(t, "{") || strings.HasPrefix(t, ",") || strings.Contains(t, "referenced_image_ids") {
+		return true
+	}
+	return false
+}
+
+func (c *Client) emitBodyDelta(result *ChatResult, lastText *string, text string, handler StreamHandler) {
+	if text == "" || result.shouldSkipImageGenToolBodyDelta(text) {
+		return
+	}
+	newText := *lastText + text
+	if newText == *lastText {
+		return
+	}
+	toEmit := newText[result.emittedBodyLen:]
+	*lastText = newText
+	if result.deltaChannel == "final" {
+		result.assistantFinalText = newText
+	}
+	if len(toEmit) == 0 {
+		return
+	}
+	result.emittedBodyLen = len(newText)
+	if handler != nil {
+		handler(toEmit)
+	}
+}
+
+func (c *Client) emitBodyFull(result *ChatResult, lastText *string, text, channel string, handler StreamHandler) {
+	if text == "" {
+		return
+	}
+	if text == *lastText {
+		return
+	}
+	if len(text) < len(*lastText) && strings.HasPrefix(*lastText, text) {
+		return
+	}
+	if len(text) <= len(*lastText) {
+		return
+	}
+	*lastText = text
+	if channel == "final" {
+		result.assistantFinalText = text
+		c.logf("[reply-final] channel=final len=%d", len([]rune(text)))
+	}
+	toEmit := text[result.emittedBodyLen:]
+	if len(toEmit) == 0 {
+		return
+	}
+	result.emittedBodyLen = len(text)
+	if handler != nil {
+		handler(toEmit)
+	}
+}
+
 // processDeltaSSE 处理 delta 编码模式的 SSE 事件
 // ChatGPT delta 格式有多种变体：
 //  A) 顶层 patch：{"p":"/message/content/parts/0","o":"append","v":"text"}
@@ -869,22 +1066,20 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 	pOp, _ := evt["o"].(string)
 
 	// 格式 A：顶层 append patch
-	if pPath == "/message/content/parts/0" && pOp == "append" {
-		if text, ok := evt["v"].(string); ok && text != "" {
-			// 判断当前 channel 是否是思考（由上层 add 初始化时记录）
-			if result.deltaChannel == "analysis" {
-				result.ThinkingText += text
-				if handler != nil {
-					handler("\x00THINK\x00" + text)
-				}
-			} else {
-				*lastText += text
-				if handler != nil {
-					handler(text)
+	if pOp == "append" {
+		if result.ExpectGeneratedImages && (pPath == "/message/content/text" || strings.HasPrefix(pPath, "/message/content/text")) {
+			return
+		}
+		if pPath == "/message/content/parts/0" {
+			if text, ok := evt["v"].(string); ok && text != "" {
+				if result.isAnalysisStream() {
+					c.emitThinkingDelta(result, text, handler)
+				} else {
+					c.emitBodyDelta(result, lastText, text, handler)
 				}
 			}
+			return
 		}
-		return
 	}
 
 	v := evt["v"]
@@ -894,16 +1089,10 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 	_, hasO := evt["o"]
 	if !hasP && !hasO {
 		if text, ok := v.(string); ok && text != "" {
-			if result.deltaChannel == "analysis" {
-				result.ThinkingText += text
-				if handler != nil {
-					handler("\x00THINK\x00" + text)
-				}
+			if result.isAnalysisStream() {
+				c.emitThinkingDelta(result, text, handler)
 			} else {
-				*lastText += text
-				if handler != nil {
-					handler(text)
-				}
+				c.emitBodyDelta(result, lastText, text, handler)
 			}
 			return
 		}
@@ -919,8 +1108,7 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 
 				if author == "assistant" && msgID != "" {
 					result.LastAssistantMsgID = msgID
-					// 记录当前消息的 channel，供后续 append patch 使用
-					result.deltaChannel = channel
+					result.noteAssistantChannel(channel)
 
 					// content_type="thoughts"：解析思考步骤（summary + content）
 					if content, ok := msg["content"].(map[string]interface{}); ok {
@@ -965,14 +1153,11 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 						}
 					}
 				}
-				// final channel 上的完整文本（通常是最后确认，此时 lastText 应已累积完整）
+				// final channel 上的完整文本（网页端可见的最终 JSON/正文）
 				if author == "assistant" && channel == "final" {
-					if text := getFirstStringPart(msg); text != "" && len(text) > len(*lastText) {
-						delta := text[len(*lastText):]
-						*lastText = text
-						if handler != nil && delta != "" {
-							handler(delta)
-						}
+					if text := getFirstStringPart(msg); text != "" {
+						result.noteAssistantChannel("final")
+						c.emitBodyFull(result, lastText, text, "final", handler)
 					}
 				}
 			}
@@ -985,18 +1170,15 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 			if patch, ok := p.(map[string]interface{}); ok {
 				pp, _ := patch["p"].(string)
 				po, _ := patch["o"].(string)
+				if result.ExpectGeneratedImages && po == "append" && (pp == "/message/content/text" || strings.HasPrefix(pp, "/message/content/text")) {
+					continue
+				}
 				if pp == "/message/content/parts/0" && po == "append" {
 					if text, ok := patch["v"].(string); ok && text != "" {
-						if result.deltaChannel == "analysis" {
-							result.ThinkingText += text
-							if handler != nil {
-								handler("\x00THINK\x00" + text)
-							}
+						if result.isAnalysisStream() {
+							c.emitThinkingDelta(result, text, handler)
 						} else {
-							*lastText += text
-							if handler != nil {
-								handler(text)
-							}
+							c.emitBodyDelta(result, lastText, text, handler)
 						}
 					}
 				}
@@ -1066,186 +1248,20 @@ func (c *Client) processFullSSE(evt map[string]interface{}, result *ChatResult, 
 		if text == "" {
 			return
 		}
+		result.noteAssistantChannel(channel)
 		if channel == "analysis" {
-			// 思考过程：增量发送，用 lastThinkText 追踪已发量
 			if len(text) > len(result.ThinkingText) {
-				delta := text[len(result.ThinkingText):]
+				c.emitThinkingDelta(result, text[len(result.ThinkingText):], handler)
 				result.ThinkingText = text
-				if handler != nil {
-					handler("\x00THINK\x00" + delta)
-				}
 			}
-		} else {
-			// 正文（含 final）
-			if len(text) > len(*lastText) {
-				delta := text[len(*lastText):]
-				if handler != nil {
-					handler(delta)
-				}
-				*lastText = text
-			}
+		} else if channel == "final" {
+			c.emitBodyFull(result, lastText, text, "final", handler)
+		} else if !result.sawAnalysisChannel {
+			c.emitBodyFull(result, lastText, text, channel, handler)
 		}
 	}
 }
 
-// pollImageStreamStatus 通过 HTTP 轮询等待图片生成完成，返回所有图片 file ID 列表和对话末尾消息 ID
-// 策略：先等 stream_status=COMPLETE，再持续轮询对话，直到没有 intermediate 节点为止
-// （多图场景：每张图片是独立节点，分批完成，必须等所有节点完成才能拿全）
-// 返回：fileIDs, lastMsgID（对话 current_node，用于下轮 parent_message_id）, error
-func (c *Client) pollImageStreamStatus(conversationID string) ([]string, string, error) {
-	const (
-		totalTimeout = 10 * time.Minute
-		pollInterval = 5 * time.Second
-	)
-	deadline := time.Now().Add(totalTimeout)
-
-	// 第一阶段：等待 SSE stream 结束（通常几秒内）
-	for time.Now().Before(deadline) {
-		status, err := c.fetchStreamStatus(conversationID)
-		if err != nil {
-			c.logf("[image-poll] stream_status 请求失败: %v，重试...", err)
-		} else {
-			c.logf("[image-poll] stream_status=%s", status)
-			if strings.EqualFold(status, "COMPLETE") {
-				break
-			}
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	// 第二阶段：轮询对话详情
-	// 多图时每张图片是独立节点，必须等所有节点都不再 intermediate 才算完成
-	for time.Now().Before(deadline) {
-		fileIDs, lastMsgID, hasPending, err := c.fetchConversationImageFileIDs(conversationID)
-		if err != nil {
-			c.logf("[image-poll] 对话查询失败: %v，重试...", err)
-			time.Sleep(pollInterval)
-			continue
-		}
-		if hasPending {
-			c.logf("[image-poll] 已收到 %d 张图片，仍有生成中的节点，继续等待...", len(fileIDs))
-			time.Sleep(pollInterval)
-			continue
-		}
-		if len(fileIDs) > 0 {
-			return fileIDs, lastMsgID, nil
-		}
-		c.logf("[image-poll] 图片尚未就绪，等待中...")
-		time.Sleep(pollInterval)
-	}
-	return nil, "", fmt.Errorf("等待图片超时（%v）", totalTimeout)
-}
-
-// fetchStreamStatus 查询对话的 stream_status
-func (c *Client) fetchStreamStatus(conversationID string) (string, error) {
-	apiPath := "/backend-api/conversation/" + conversationID + "/stream_status"
-	resp, err := c.httpClient.R().
-		SetHeaders(map[string]string{
-			"x-openai-target-path":  apiPath,
-			"x-openai-target-route": "/backend-api/conversation/{conversation_id}/stream_status",
-		}).
-		Get(apiPath)
-	if err != nil {
-		return "", err
-	}
-	var result struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(resp.Bytes(), &result); err != nil {
-		return "", err
-	}
-	return result.Status, nil
-}
-
-// fetchConversationImageFileIDs 获取对话中所有图片文件 ID 列表
-// 返回：fileIDs（已就绪图片 ID），currentNode（对话末尾节点 ID，用于下轮 parent_message_id），hasPending，error
-// 多图场景下，每张图片可能是独立的 multimodal_text 节点，分批完成
-func (c *Client) fetchConversationImageFileIDs(conversationID string) (fileIDs []string, currentNode string, hasPending bool, err error) {
-	apiPath := "/backend-api/conversation/" + conversationID
-	resp, respErr := c.httpClient.R().
-		SetHeaders(map[string]string{
-			"x-openai-target-path":  apiPath,
-			"x-openai-target-route": "/backend-api/conversation/{conversation_id}",
-		}).
-		Get(apiPath)
-	if respErr != nil {
-		return nil, "", false, fmt.Errorf("获取对话失败: %w", respErr)
-	}
-
-	var conv map[string]interface{}
-	if jsonErr := json.Unmarshal(resp.Bytes(), &conv); jsonErr != nil {
-		return nil, "", false, fmt.Errorf("解析对话失败: %w", jsonErr)
-	}
-
-	// current_node 是对话链末尾节点 ID，用于下轮对话的 parent_message_id
-	currentNode, _ = conv["current_node"].(string)
-
-	mapping, _ := conv["mapping"].(map[string]interface{})
-	seen := make(map[string]bool) // 去重：同一 file ID 可能出现在多个节点中
-
-	for _, nodeRaw := range mapping {
-		node, ok := nodeRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		msg, ok := node["message"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		content, _ := msg["content"].(map[string]interface{})
-		if ct, _ := content["content_type"].(string); ct != "multimodal_text" {
-			continue
-		}
-
-		// 检查该节点是否仍在生成中
-		isIntermediate := false
-		if meta, ok := msg["metadata"].(map[string]interface{}); ok {
-			if gr, ok := meta["ghostrider"].(map[string]interface{}); ok {
-				if grStatus, _ := gr["status"].(string); grStatus == "intermediate" {
-					isIntermediate = true
-				}
-			}
-			// is_temporal_turn=true 也表示异步还未完成
-			if isTemporal, _ := meta["is_temporal_turn"].(bool); isTemporal {
-				isIntermediate = true
-			}
-		}
-
-		if isIntermediate {
-			hasPending = true
-		}
-
-		// 收集所有 image_asset_pointer，去重处理
-		parts, _ := content["parts"].([]interface{})
-		for _, p := range parts {
-			part, _ := p.(map[string]interface{})
-			if pct, _ := part["content_type"].(string); pct == "image_asset_pointer" {
-				ptr, _ := part["asset_pointer"].(string)
-				if strings.HasPrefix(ptr, "sediment://") {
-					fileID := strings.TrimPrefix(ptr, "sediment://")
-					if !seen[fileID] {
-						seen[fileID] = true
-						fileIDs = append(fileIDs, fileID)
-					}
-				}
-			}
-		}
-	}
-
-	return fileIDs, currentNode, hasPending, nil
-}
-
-// fetchConversationImageFileID 兼容旧调用，返回第一张图片的 file ID
-func (c *Client) fetchConversationImageFileID(conversationID string) (string, error) {
-	ids, _, _, err := c.fetchConversationImageFileIDs(conversationID)
-	if err != nil {
-		return "", err
-	}
-	if len(ids) == 0 {
-		return "", fmt.Errorf("对话中未找到图片文件 ID")
-	}
-	return ids[0], nil
-}
 
 // fetchTextdocs 调用 textdocs API 获取思考步骤的详细内容
 // textdocs 返回一个对象数组，每个对象包含 type、thought（含 summary/content）等字段

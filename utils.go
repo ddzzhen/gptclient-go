@@ -78,6 +78,25 @@ func getFirstStringPart(msg map[string]interface{}) string {
 
 var fileIDRegexp = regexp.MustCompile(`file_[a-f0-9]+`)
 
+// LogContentPreview 打印文本长度与首尾预览（UTF-8 安全截断）。
+func LogContentPreview(logf func(string, ...interface{}), tag string, s string) {
+	if logf == nil {
+		return
+	}
+	runes := []rune(s)
+	n := len(runes)
+	if n == 0 {
+		logf("[%s] len=0 (empty)", tag)
+		return
+	}
+	const edge = 500
+	preview := s
+	if n > edge*2 {
+		preview = string(runes[:edge]) + "\n...(truncated " + fmt.Sprintf("%d", n-edge*2) + " runes)...\n" + string(runes[n-edge:])
+	}
+	logf("[%s] len=%d preview:\n%s", tag, n, preview)
+}
+
 func extractFileID(pointer string) string {
 	if pointer == "" {
 		return ""

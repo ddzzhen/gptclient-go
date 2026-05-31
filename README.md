@@ -15,6 +15,7 @@
 - ✅ 临时模式（不保存对话历史 / 不更新记忆）
 - ✅ 浏览器指纹伪装（TLS 指纹 + Edge 146 UA + 完整 sec-ch-ua Headers）
 - ✅ OpenAI 兼容 API 服务器（`/v1/chat/completions`）+ 多 Token 池轮换
+- ✅ 流式产物侧信道（`sentinel`：生图多版本、沙箱文件）— 见 [docs/CLIENT_STREAMING.md](docs/CLIENT_STREAMING.md)
 - ✅ 开箱即用的交互式 CLI（REPL）
 
 ---
@@ -205,6 +206,26 @@ docker compose up -d
 首次启动若仅有旧版 `tokens.txt`（按行 `st:` / JWT），会自动迁移到 `tokens.json`。
 
 配置 `TOKEN_REFRESH_AHEAD_SEC`（默认 300）可在 AT 过期前提前用 ST 换新；刷新后会写回 JSON。池模式请求若遇 401 会自动尝试刷新一次。
+
+### 产物检测与流式抓包（stream-capture）
+
+对话结束后是否轮询**图片 / 沙箱文件（pdf、txt 等）**，由 SSE 与对话 JSON 中的**结构化信号**决定（如 `image_gen_task_id`、`author.name=python`、`execution_output`、`/mnt/data/...`），**不使用用户/助手文本关键词**。
+
+抓取三种场景原始流式数据以便分析、调参：
+
+```bash
+go run ./cmd/stream-capture/ -config config.json
+# 仅跑某一类: -case image | txt | pdf
+```
+
+输出目录 `testdata/stream-captures/<时间>-<case>/`：
+
+| 文件 | 内容 |
+|------|------|
+| `sse.ndjson` | 每条 SSE 的 event、data、解析出的 signals |
+| `conversation.json` | 对话 mapping 全量 |
+| `analysis.json` | 信号汇总与 `ArtifactPlan` |
+| `summary.txt` | 人类可读摘要 |
 
 ### API 兼容性说明
 

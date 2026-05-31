@@ -41,6 +41,9 @@ type Client struct {
 	// DisableAutoImage 设为 true 时，Chat/ChatStream 不会自动阻塞等待图片下载。
 	// 适合 DLL / 外部调用场景，由调用方自己异步处理图片下载。
 	DisableAutoImage bool
+
+	// StreamRecorder 非空时记录全部 SSE 事件（供 stream-capture 分析）。
+	StreamRecorder *StreamRecorder
 }
 
 // NewClient 创建新的 ChatGPT 客户端

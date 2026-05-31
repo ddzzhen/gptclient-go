@@ -1,6 +1,10 @@
 package server
 
-import "time"
+import (
+	"time"
+
+	sentinel "sentinel-go"
+)
 
 // ─── 请求类型 ────────────────────────────────────────────────────────────────
 
@@ -24,6 +28,18 @@ type ChatCompletionRequest struct {
 	Size string `json:"size,omitempty"`
 	// n 生成张数（暂不支持 >1，预留字段）
 	N int `json:"n,omitempty"`
+
+	// IncludeThinking 为 true 时流式响应包含 \x00THINK\x00 思考增量（内置 Web UI 使用）；默认 false，仅输出 final 正文
+	IncludeThinking bool `json:"include_thinking,omitempty"`
+
+	// ArtifactDelivery 产物下发：url（默认）| base64 | base64_chunked
+	ArtifactDelivery string `json:"artifact_delivery,omitempty"`
+	// ArtifactBase64ChunkSize base64_chunked 时每块原始字节数，默认 393216
+	ArtifactBase64ChunkSize int `json:"artifact_base64_chunk_size,omitempty"`
+	// ArtifactMarkdown 为 true 时在 content 末尾附加 markdown 链接（兼容旧客户端）；默认 false
+	ArtifactMarkdown bool `json:"artifact_markdown,omitempty"`
+	// ArtifactImageRevisions 生图多版本：all | latest_per_slot（默认）| final_only
+	ArtifactImageRevisions string `json:"artifact_image_revisions,omitempty"`
 }
 
 // Message OpenAI 消息格式
@@ -65,6 +81,9 @@ type ChatCompletionResponse struct {
 
 	// 扩展字段：返回给客户端，下次请求带上即可续接对话
 	ConversationID string `json:"conversation_id,omitempty"`
+
+	// Sentinel 侧信道事件（非流式一次返回数组）
+	Sentinel []sentinel.StreamEvent `json:"sentinel,omitempty"`
 }
 
 // Choice 非流式选项
@@ -94,6 +113,9 @@ type ChatCompletionChunk struct {
 
 	// 扩展字段：只在第一个 chunk 中返回
 	ConversationID string `json:"conversation_id,omitempty"`
+
+	// Sentinel 侧信道：产物/进度（与 delta.content 正文分离）
+	Sentinel *sentinel.StreamEvent `json:"sentinel,omitempty"`
 }
 
 // ChunkChoice 流式选项

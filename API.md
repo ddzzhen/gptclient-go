@@ -22,6 +22,8 @@
 
 核心的对话交互接口，完全兼容 OpenAI `/v1/chat/completions` 格式，支持纯文本、流式传输以及多模态（图生文/图生图）请求。
 
+> **流式产物与最终图片**：正文走 `delta.content`，生图/沙箱文件走 `sentinel` 侧信道，详见 [docs/CLIENT_STREAMING.md](docs/CLIENT_STREAMING.md)。
+
 - **URL**: `/v1/chat/completions`
 - **Method**: `POST`
 - **Headers**:

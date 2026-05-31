@@ -123,14 +123,33 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 	createdAt := time.Now().Unix()
 
 	if req.Stream {
-		h.handleStream(c, entry, opts, req.ConversationID, chatID, req.Model, createdAt)
+		h.handleStream(c, entry, opts, req, req.ConversationID, chatID, req.Model, createdAt)
 	} else {
-		h.handleNonStream(c, entry, opts, req.ConversationID, chatID, req.Model, createdAt)
+		h.handleNonStream(c, entry, opts, req, req.ConversationID, chatID, req.Model, createdAt)
+	}
+}
+
+func (h *ChatHandler) buildArtifactConfig(c *gin.Context, req ChatCompletionRequest, convID string, onEvent func(sentinel.StreamEvent)) sentinel.ArtifactStreamConfig {
+	return sentinel.ArtifactStreamConfig{
+		Delivery:         req.ArtifactDelivery,
+		ChunkSize:        req.ArtifactBase64ChunkSize,
+		ImageRevisions:   req.ArtifactImageRevisions,
+		OnEvent:          onEvent,
+		BuildImageURL: func(fileID string) string {
+			rel := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", convID, fileID)
+			return buildAbsoluteURL(c, h.cfg, rel)
+		},
+		BuildSandboxURL: func(messageID, sandboxPath string) string {
+			rel := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+				convID, messageID, url.QueryEscape(sandboxPath))
+			return buildAbsoluteURL(c, h.cfg, rel)
+		},
 	}
 }
 
 // handleStream 流式响应
-func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sentinel.ChatOptions, reqConvID, chatID, model string, created int64) {
+func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sentinel.ChatOptions, req ChatCompletionRequest, reqConvID, chatID, model string, created int64) {
+	includeThinking := req.IncludeThinking
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -138,7 +157,6 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 
 	// 第一个 chunk：role=assistant
 	firstSent := false
-	registeredConvID := ""
 
 	w := c.Writer
 	flusher, canFlush := w.(http.Flusher)
@@ -151,7 +169,23 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		}
 	}
 
+	streamedToClient := strings.Builder{}
+	registeredConvID := reqConvID
+
+	writeSentinel := func(ev sentinel.StreamEvent) {
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{}, FinishReason: nil}},
+			Sentinel: &ev,
+		})
+	}
+
+	opts.Artifacts = h.buildArtifactConfig(c, req, registeredConvID, writeSentinel)
+
 	handler := func(delta string) {
+		if !includeThinking && len(delta) > 0 && delta[0] == '\x00' {
+			return
+		}
 		if !firstSent {
 			// 第一个有内容的 chunk，先发 role
 			roleChunk := ChatCompletionChunk{
@@ -168,6 +202,8 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 			writeChunk(roleChunk)
 			firstSent = true
 		}
+
+		streamedToClient.WriteString(delta)
 
 		contentChunk := ChatCompletionChunk{
 			ID:      chatID,
@@ -206,10 +242,33 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 	if result.ConversationID != "" {
 		registeredConvID = result.ConversationID
 		h.session.Register(registeredConvID, entry)
+		opts.Artifacts = h.buildArtifactConfig(c, req, registeredConvID, writeSentinel)
 	}
 
-	// 思考步骤详细内容（textdocs API 获取，流结束后推送）
-	if len(result.ThinkSteps) > 0 {
+	sentinel.LogContentPreview(func(format string, args ...interface{}) {
+		fmt.Printf("[chat-stream-client] "+format+"\n", args...)
+	}, "stream-deltas", streamedToClient.String())
+	sentinel.LogContentPreview(func(format string, args ...interface{}) {
+		fmt.Printf("[chat-stream-upstream] "+format+"\n", args...)
+	}, "result-text", result.Text)
+
+	// 流式增量未发出但 result.Text 已有正文（例如仅在 WS catchup 收齐）时补发
+	if streamedToClient.Len() == 0 && result.Text != "" {
+		if !firstSent {
+			writeChunk(ChatCompletionChunk{
+				ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+				Choices: []ChunkChoice{{Index: 0, Delta: Delta{Role: "assistant"}, FinishReason: nil}},
+			})
+			firstSent = true
+		}
+		writeChunk(ChatCompletionChunk{
+			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: result.Text}, FinishReason: nil}},
+		})
+	}
+
+	// 思考步骤详细内容（流结束后推送，仅 Web UI 请求 include_thinking 时）
+	if includeThinking && len(result.ThinkSteps) > 0 {
 		var thinkContent strings.Builder
 		thinkContent.WriteString("\x00THINK_DETAILS\x00")
 		for i, step := range result.ThinkSteps {
@@ -226,8 +285,14 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		})
 	}
 
-	// 多图：为每个 file ID 生成代理 URL 并输出 markdown（绝对路径）
-	if len(result.ImageFileIDs) > 0 {
+	if result.ExpectGeneratedImages {
+		entry.client.FinishImageGenWS(result, opts)
+	}
+	// 兜底：沙箱等未在流中推送的产物
+	entry.client.EmitNewArtifacts(opts.Artifacts, result)
+
+	// 兼容：可选 markdown 链接（旧客户端）
+	if req.ArtifactMarkdown && result.ExpectGeneratedImages && len(result.ImageFileIDs) > 0 {
 		var imgContent strings.Builder
 		for i, fileID := range result.ImageFileIDs {
 			relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, fileID)
@@ -237,13 +302,13 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
 			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: imgContent.String()}, FinishReason: nil}},
 		})
-	} else if result.ImageFileID != "" {
+	} else if req.ArtifactMarkdown && result.ExpectGeneratedImages && result.ImageFileID != "" {
 		relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", registeredConvID, result.ImageFileID)
 		writeChunk(ChatCompletionChunk{
 			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
 			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, relURL))}, FinishReason: nil}},
 		})
-	} else if result.ImagePath != "" {
+	} else if req.ArtifactMarkdown && result.ExpectGeneratedImages && result.ImagePath != "" {
 		p := result.ImagePath
 		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
 			p = strings.ReplaceAll(p, "\\", "/")
@@ -257,22 +322,23 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		})
 	}
 
-	// 多 PDF：输出下载链接（绝对路径）
-	if len(result.PDFArtifacts) > 0 {
-		var pdfContent strings.Builder
-		for i, pdf := range result.PDFArtifacts {
+	if req.ArtifactMarkdown {
+		if files := sandboxFilesForHandler(result); len(files) > 0 {
+		var fileContent strings.Builder
+		for i, f := range files {
 			relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
-				registeredConvID, pdf.MessageID, url.QueryEscape(pdf.SandboxPath))
-			label := pdf.FileName
+				registeredConvID, f.MessageID, url.QueryEscape(f.SandboxPath))
+			label := f.FileName
 			if label == "" {
-				label = fmt.Sprintf("document_%d.pdf", i+1)
+				label = fmt.Sprintf("file_%d", i+1)
 			}
-			pdfContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL)))
+			fileContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL)))
 		}
 		writeChunk(ChatCompletionChunk{
 			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: pdfContent.String()}, FinishReason: nil}},
+			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: fileContent.String()}, FinishReason: nil}},
 		})
+		}
 	}
 
 	// 最后一个 chunk（stop）
@@ -298,7 +364,13 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 }
 
 // handleNonStream 非流式响应
-func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts sentinel.ChatOptions, reqConvID, chatID, model string, created int64) {
+func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts sentinel.ChatOptions, req ChatCompletionRequest, reqConvID, chatID, model string, created int64) {
+	var sentinelEvents []sentinel.StreamEvent
+	convForArt := reqConvID
+	opts.Artifacts = h.buildArtifactConfig(c, req, convForArt, func(ev sentinel.StreamEvent) {
+		sentinelEvents = append(sentinelEvents, ev)
+	})
+
 	result, err := h.chatWithRetry(c, entry, opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
@@ -310,20 +382,31 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 	// 注册 session
 	if result.ConversationID != "" {
 		h.session.Register(result.ConversationID, entry)
+		convForArt = result.ConversationID
+		opts.Artifacts = h.buildArtifactConfig(c, req, convForArt, func(ev sentinel.StreamEvent) {
+			sentinelEvents = append(sentinelEvents, ev)
+		})
 	}
 
-	content := result.Text
+	if result.ExpectGeneratedImages {
+		entry.client.FinishImageGenWS(result, opts)
+	}
+	entry.client.EmitNewArtifacts(opts.Artifacts, result)
 
-	// 多图：为每个 file ID 生成代理 URL（绝对路径）
-	if len(result.ImageFileIDs) > 0 {
+	content := result.Text
+	sentinel.LogContentPreview(func(format string, args ...interface{}) {
+		fmt.Printf("[chat-response] "+format+"\n", args...)
+	}, "client-body", content)
+
+	if req.ArtifactMarkdown && result.ExpectGeneratedImages && len(result.ImageFileIDs) > 0 {
 		for i, fileID := range result.ImageFileIDs {
 			relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, fileID)
 			content += fmt.Sprintf("\n\n![Generated Image %d](%s)", i+1, buildAbsoluteURL(c, h.cfg, relURL))
 		}
-	} else if result.ImageFileID != "" {
+	} else if req.ArtifactMarkdown && result.ExpectGeneratedImages && result.ImageFileID != "" {
 		relURL := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", result.ConversationID, result.ImageFileID)
 		content += fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, relURL))
-	} else if result.ImagePath != "" {
+	} else if req.ArtifactMarkdown && result.ExpectGeneratedImages && result.ImagePath != "" {
 		p := result.ImagePath
 		if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
 			p = strings.ReplaceAll(p, "\\", "/")
@@ -334,15 +417,16 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 		content += fmt.Sprintf("\n\n![Generated Image](%s)", buildAbsoluteURL(c, h.cfg, p))
 	}
 
-	// 多 PDF（绝对路径）
-	for i, pdf := range result.PDFArtifacts {
-		relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
-			result.ConversationID, pdf.MessageID, url.QueryEscape(pdf.SandboxPath))
-		label := pdf.FileName
-		if label == "" {
-			label = fmt.Sprintf("document_%d.pdf", i+1)
+	if req.ArtifactMarkdown {
+		for i, f := range sandboxFilesForHandler(result) {
+			relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+				result.ConversationID, f.MessageID, url.QueryEscape(f.SandboxPath))
+			label := f.FileName
+			if label == "" {
+				label = fmt.Sprintf("file_%d", i+1)
+			}
+			content += fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL))
 		}
-		content += fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL))
 	}
 
 	// 非流式响应：收集思考内容到 reasoning_content
@@ -373,6 +457,7 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 		}},
 		Usage:          Usage{},
 		ConversationID: result.ConversationID,
+		Sentinel:       sentinelEvents,
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -569,6 +654,17 @@ func buildAbsoluteURL(c *gin.Context, cfg *ServerConfig, path string) string {
 // sizeToAspect 将 OpenAI 风格的 size 字符串转换为 ImageAspectRatio。
 // 支持 "1:1" / "3:4" / "9:16" / "4:3" / "16:9" 宽高比直写，
 // 以及兼容 OpenAI 像素格式 "256x256" / "1024x1024" / "1792x1024" / "1024x1792"。
+func sandboxFilesForHandler(result *sentinel.ChatResult) []sentinel.SandboxArtifact {
+	if len(result.SandboxArtifacts) > 0 {
+		return result.SandboxArtifacts
+	}
+	out := make([]sentinel.SandboxArtifact, len(result.PDFArtifacts))
+	for i, p := range result.PDFArtifacts {
+		out[i] = sentinel.SandboxArtifact(p)
+	}
+	return out
+}
+
 func sizeToAspect(size string) sentinel.ImageAspectRatio {
 	switch strings.TrimSpace(strings.ToLower(size)) {
 	case "1:1", "256x256", "512x512", "1024x1024":

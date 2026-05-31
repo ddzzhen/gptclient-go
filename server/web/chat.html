@@ -440,7 +440,7 @@ async function sendMessage() {
 
   let fullText = '';
   try {
-    const body = { model, messages: [{ role: 'user', content: content }], stream: true };
+    const body = { model, messages: [{ role: 'user', content: content }], stream: true, include_thinking: true };
     if (convID) body.conversation_id = convID;
     if (imageMode) {
       const size = document.getElementById('size-select').value;
