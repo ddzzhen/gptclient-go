@@ -31,11 +31,12 @@ type UploadedFile struct {
 }
 
 // UploadFile 执行完整三步上传。
-func (c *Client) UploadFile(ctx context.Context, data []byte, fileName string) (*UploadedFile, error) {
+// mimeHint 可选：来自 data URL header 或 HTTP Content-Type；为空或不可靠时根据文件内容嗅探。
+func (c *Client) UploadFile(ctx context.Context, data []byte, fileName, mimeHint string) (*UploadedFile, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty file data")
 	}
-	mime, ext := sniffMime(data)
+	mime, ext := resolveMime(data, mimeHint)
 	useCase := "multimodal"
 	if !strings.HasPrefix(mime, "image/") {
 		useCase = "my_files"
@@ -216,28 +217,71 @@ func (u *UploadedFile) ToAssetPointerPart() AssetPointerPart {
 	}
 }
 
+// resolveMime 优先使用 mimeHint，否则嗅探文件内容。
+func resolveMime(data []byte, mimeHint string) (mime, ext string) {
+	sniffed, sniffExt := sniffMime(data)
+	hint := normalizeMime(mimeHint)
+	if hint != "" && hint != "application/octet-stream" {
+		ext = extFromMime(hint)
+		if ext == "" {
+			ext = sniffExt
+		}
+		return hint, ext
+	}
+	return sniffed, sniffExt
+}
+
+func normalizeMime(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, ";"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	return s
+}
+
+func extFromMime(mime string) string {
+	switch strings.ToLower(normalizeMime(mime)) {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "application/pdf":
+		return ".pdf"
+	case "application/msword":
+		return ".doc"
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return ".docx"
+	case "application/vnd.ms-excel":
+		return ".xls"
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return ".xlsx"
+	case "application/vnd.ms-powerpoint":
+		return ".ppt"
+	case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+		return ".pptx"
+	case "text/plain":
+		return ".txt"
+	case "text/csv":
+		return ".csv"
+	case "application/json":
+		return ".json"
+	case "text/markdown":
+		return ".md"
+	default:
+		return ""
+	}
+}
+
 func sniffMime(data []byte) (mime, ext string) {
 	n := 512
 	if len(data) < n {
 		n = len(data)
 	}
 	mime = http.DetectContentType(data[:n])
-	if i := strings.Index(mime, ";"); i >= 0 {
-		mime = strings.TrimSpace(mime[:i])
-	}
-	switch {
-	case strings.EqualFold(mime, "image/jpeg"):
-		ext = ".jpg"
-	case strings.EqualFold(mime, "image/png"):
-		ext = ".png"
-	case strings.EqualFold(mime, "image/gif"):
-		ext = ".gif"
-	case strings.EqualFold(mime, "image/webp"):
-		ext = ".webp"
-	case strings.EqualFold(mime, "application/pdf"):
-		ext = ".pdf"
-	default:
-		ext = ""
-	}
-	return
+	ext = extFromMime(mime)
+	return mime, ext
 }

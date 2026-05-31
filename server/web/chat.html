@@ -280,17 +280,52 @@ ta.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 
+// 规范化 Bearer：JSON / Access----Session / 裸 Access；拒绝无效串
+function normalizeBearerToken(raw) {
+  raw = (raw || '').trim();
+  if (!raw) return '';
+  const m = raw.match(/"accessToken"\s*:\s*"([^"]+)"/);
+  if (m && m[1].startsWith('eyJ') && !m[1].startsWith('eyJhbGciOiJkaXIi')) return m[1];
+  const sep = raw.indexOf('----');
+  if (sep >= 0) {
+    const at = raw.slice(0, sep).trim();
+    if (at.startsWith('eyJ') && !at.startsWith('eyJhbGciOiJkaXIi')) return at;
+  }
+  if (raw.startsWith('eyJ') && !raw.startsWith('eyJhbGciOiJkaXIi')) return raw;
+  return '';
+}
+function authHeaders(token) {
+  const h = {};
+  if (token) h['Authorization'] = `Bearer ${token}`;
+  return h;
+}
+function saveApiToken(raw) {
+  const el = document.getElementById('api-token');
+  const norm = normalizeBearerToken(raw);
+  if (raw && !norm) {
+    el.value = '';
+    localStorage.removeItem('sg-token');
+    return '';
+  }
+  el.value = norm;
+  if (norm) localStorage.setItem('sg-token', norm);
+  else localStorage.removeItem('sg-token');
+  return norm;
+}
+
 // 从 localStorage 恢复配置
 window.addEventListener('load', () => {
-  const t = localStorage.getItem('sg-token');
-  if (t) document.getElementById('api-token').value = t;
+  const saved = localStorage.getItem('sg-token');
+  if (saved) saveApiToken(saved);
   const m = localStorage.getItem('sg-model');
   if (m) document.getElementById('model-select').value = m;
   loadModels();
 });
 
 document.getElementById('api-token').addEventListener('change', () => {
-  localStorage.setItem('sg-token', document.getElementById('api-token').value);
+  const prev = document.getElementById('api-token').value;
+  const norm = saveApiToken(prev);
+  if (prev && !norm) showToast('⚠️ Token 无效已清除，将使用仪表盘上传的 Token 池', 'warn', 4000);
 });
 document.getElementById('model-select').addEventListener('change', () => {
   localStorage.setItem('sg-model', document.getElementById('model-select').value);
@@ -316,8 +351,8 @@ function toggleImageMode() {
 
 async function loadModels() {
   try {
-    const token = document.getElementById('api-token').value;
-    const d = await fetch('/v1/models', {headers: {'Authorization': `Bearer ${token}`}}).then(r => r.json());
+    const token = normalizeBearerToken(document.getElementById('api-token').value);
+    const d = await fetch('/v1/models', {headers: authHeaders(token)}).then(r => r.json());
     if (!d.data) return;
     const sel = document.getElementById('model-select');
     const cur = sel.value;
@@ -352,11 +387,11 @@ function showToast(msg, type = 'warn', ms = 3000) {
 
 async function sendMessage() {
   if (isStreaming) return;
-  const token = document.getElementById('api-token').value.trim();
+  const token = normalizeBearerToken(document.getElementById('api-token').value);
   const text = ta.value.trim();
   if (!text && attachedImages.length === 0) return;
 
-  // 如果没有输入 token，先检查后端池是否有可用 token
+  // 未填有效 token 时使用 Token 池
   if (!token) {
     try {
       const h = await fetch('/health').then(r => r.json());
@@ -420,7 +455,7 @@ async function sendMessage() {
 
     const resp = await fetch('/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      headers: { ...authHeaders(token), 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
 

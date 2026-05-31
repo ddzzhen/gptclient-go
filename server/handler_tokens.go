@@ -2,7 +2,6 @@ package server
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -49,9 +48,7 @@ func (h *TokensHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
-	// 直接按行解析，parseTokenLine 内部已处理 JSON/AT/ST 各种格式
-	lines := strings.Split(body.Tokens, "\n")
-	added := h.pool.Add(lines...)
+	added := h.pool.Add(splitUploadText(body.Tokens)...)
 
 	total, valid, _ := h.pool.Stats()
 	c.JSON(http.StatusOK, gin.H{

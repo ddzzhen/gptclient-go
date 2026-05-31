@@ -66,12 +66,12 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 	var uploadedImages []sentinel.UploadedFile
 	for _, b64 := range b64Images {
 		var data []byte
-		var fileName string
+		var fileName, mimeHint string
 		var err error
 
 		if strings.HasPrefix(b64, "http://") || strings.HasPrefix(b64, "https://") {
 			// HTTP/HTTPS URL：先下载再上传
-			data, fileName, err = downloadURL(b64)
+			data, fileName, mimeHint, err = downloadURL(b64)
 			if err != nil || len(data) == 0 {
 				continue
 			}
@@ -92,13 +92,13 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 			if err != nil || len(data) == 0 {
 				continue
 			}
-			mimeHint := strings.TrimSuffix(header, ";base64")
+			mimeHint = strings.TrimSuffix(header, ";base64")
 			fileName = guessFileName(mimeHint)
 		} else {
 			continue
 		}
 
-		uf, err := entry.client.UploadFile(c.Request.Context(), data, fileName)
+		uf, err := entry.client.UploadFile(c.Request.Context(), data, fileName, mimeHint)
 		if err == nil && uf != nil {
 			uploadedImages = append(uploadedImages, *uf)
 		}
@@ -509,24 +509,24 @@ func guessFileName(mime string) string {
 	return "file"
 }
 
-// downloadURL 下载 HTTP/HTTPS URL 的内容，返回字节数据和推断的文件名
-func downloadURL(rawURL string) ([]byte, string, error) {
+// downloadURL 下载 HTTP/HTTPS URL 的内容，返回字节数据、文件名与 Content-Type（作 mimeHint）
+func downloadURL(rawURL string) ([]byte, string, string, error) {
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(rawURL)
 	if err != nil {
-		return nil, "", fmt.Errorf("download %s: %w", rawURL, err)
+		return nil, "", "", fmt.Errorf("download %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("download %s: HTTP %d", rawURL, resp.StatusCode)
+		return nil, "", "", fmt.Errorf("download %s: HTTP %d", rawURL, resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", fmt.Errorf("read body %s: %w", rawURL, err)
+		return nil, "", "", fmt.Errorf("read body %s: %w", rawURL, err)
 	}
 
-	// 从 Content-Type 推断文件名
+	// 从 Content-Type 推断 MIME 与文件名
 	contentType := resp.Header.Get("Content-Type")
 	mimeType := strings.Split(contentType, ";")[0]
 	mimeType = strings.TrimSpace(mimeType)
@@ -545,7 +545,7 @@ func downloadURL(rawURL string) ([]byte, string, error) {
 			}
 		}
 	}
-	return data, fileName, nil
+	return data, fileName, mimeType, nil
 }
 
 // buildAbsoluteURL 将相对路径转换为绝对 URL

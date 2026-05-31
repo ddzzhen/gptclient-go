@@ -97,9 +97,11 @@ textarea::placeholder{color:var(--muted)}
     <div class="card-head"><span class="card-title">上传 Tokens</span></div>
     <div class="card-body">
       <div style="font-size:.78rem;color:var(--muted);margin-bottom:.75rem;line-height:1.9">
-        支持以下两种格式（可混合，每行一条）：<br>
-        ① 直接粘贴 accessToken（JWT 格式）<br>
-        ② 打开 <a href="https://chatgpt.com/api/auth/session" target="_blank" style="color:var(--accent);text-decoration:none" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">chatgpt.com/api/auth/session</a>，全选复制整页内容粘贴（自动提取 accessToken）
+        支持格式（可混合，每行一条；session JSON 可多行粘贴），保存为 <code>tokens.json</code>：<br>
+        ① 仅 Access Token（JWT，<code>eyJhbGciOiJS...</code>）<br>
+        ② <code>AccessToken----SessionToken</code>（四个连字符）<br>
+        ③ 仅 Session Token（<code>eyJhbGciOiJkaXIi...</code> 或 <code>st:...</code>）<br>
+        ④ <a href="https://chatgpt.com/api/auth/session" target="_blank" style="color:var(--accent);text-decoration:none" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">chatgpt.com/api/auth/session</a> 整页 JSON（同时提取 accessToken 与 sessionToken）
       </div>
       <textarea id="token-input" placeholder="每行一个 Token，支持纯 JWT 或完整 JSON 混合粘贴…"></textarea>
       <div class="btn-row">

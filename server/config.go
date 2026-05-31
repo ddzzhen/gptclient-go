@@ -20,7 +20,7 @@ type ServerConfig struct {
 	ImageDir     string // 图片保存目录，默认 images
 
 	// Token 池
-	TokensFile string // Token 持久化文件路径，默认 tokens.txt
+	TokensFile string // Token 持久化文件路径（JSON），默认 tokens.json
 
 	// Session 管理
 	SessionTTLMinutes int // Session 不活跃超时（分钟），默认 120
@@ -42,7 +42,7 @@ func LoadConfig() ServerConfig {
 		DefaultModel:      getEnv("DEFAULT_MODEL", "gpt-5-5-thinking"),
 		TempMode:          getEnvBool("TEMP_MODE", false),
 		ImageDir:          getEnv("IMAGE_DIR", "images"),
-		TokensFile:        getEnv("TOKENS_FILE", "tokens.txt"),
+		TokensFile:        getEnv("TOKENS_FILE", "tokens.json"),
 		SessionTTLMinutes: getEnvInt("SESSION_TTL_MINUTES", 120),
 		BaseURL:              getEnv("BASE_URL", ""),
 		TokenRefreshAheadSec: getEnvInt("TOKEN_REFRESH_AHEAD_SEC", 300),

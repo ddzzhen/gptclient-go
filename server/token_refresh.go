@@ -110,7 +110,14 @@ func parseJWTExp(token string) time.Time {
 }
 
 func isAccessToken(s string) bool {
-	return strings.HasPrefix(s, "eyJ") && strings.Count(s, ".") >= 2
+	if !strings.HasPrefix(s, "eyJ") || strings.Count(s, ".") < 2 {
+		return false
+	}
+	// JWE Session Token（alg=dir）不是 Access Token
+	if strings.HasPrefix(s, "eyJhbGciOiJkaXIi") {
+		return false
+	}
+	return true
 }
 
 func isLikelySessionToken(s string) bool {
@@ -118,37 +125,6 @@ func isLikelySessionToken(s string) bool {
 		return false
 	}
 	return len(s) >= 40
-}
-
-// parseTokenLine 解析 tokens.txt 一行：返回 AT、ST（二选一或同时有）。
-func parseTokenLine(line string) (at, st string) {
-	line = strings.TrimSpace(line)
-	if line == "" || strings.HasPrefix(line, "#") {
-		return "", ""
-	}
-	lower := strings.ToLower(line)
-	// 显式 st: / session: 前缀
-	if strings.HasPrefix(lower, "st:") {
-		return "", normalizeSessionToken(line[3:])
-	}
-	if strings.HasPrefix(lower, "session:") {
-		if i := strings.Index(line, ":"); i >= 0 {
-			return "", normalizeSessionToken(line[i+1:])
-		}
-	}
-	// JSON 整段（含 { }）：同时提取 accessToken + sessionToken
-	if strings.Contains(line, "{") {
-		return extractSessionJSON(line)
-	}
-	// 纯 JWT Access Token
-	if isAccessToken(line) {
-		return line, ""
-	}
-	// 长裸串当 Session Token
-	if isLikelySessionToken(line) {
-		return "", normalizeSessionToken(line)
-	}
-	return "", ""
 }
 
 func truncateBody(s string, n int) string {

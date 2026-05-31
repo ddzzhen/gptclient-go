@@ -1,70 +1,24 @@
 package server
 
 import (
-	"bufio"
 	"errors"
 	"log"
-	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-var accessTokenRegex = regexp.MustCompile(`"accessToken"\s*:\s*"([^"]+)"`)
-var sessionTokenRegex = regexp.MustCompile(`"sessionToken"\s*:\s*"([^"]+)"`)
-
-// cleanToken 从 JSON 中提取 accessToken；否则返回原串（非 JSON 碎片时）。
-func cleanToken(t string) string {
-	t = strings.TrimSpace(t)
-	if match := accessTokenRegex.FindStringSubmatch(t); len(match) == 2 {
-		return match[1]
-	}
-	if strings.Contains(t, "{") || strings.Contains(t, "}") {
-		return ""
-	}
-	return t
-}
-
-// extractSessionJSON 从完整 session JSON 同时提取 accessToken 和 sessionToken。
-// 两者都找到时返回 (at, st)；只找到 AT 时返回 (at, "")。
-func extractSessionJSON(line string) (at, st string) {
-	if !strings.Contains(line, "{") {
-		return "", ""
-	}
-	if m := accessTokenRegex.FindStringSubmatch(line); len(m) == 2 {
-		at = m[1]
-	}
-	if m := sessionTokenRegex.FindStringSubmatch(line); len(m) == 2 {
-		st = normalizeSessionToken(m[1])
-	}
-	return at, st
-}
-
-type poolEntry struct {
-	at        string
-	st        string
-	expiresAt time.Time
-}
-
-func (e *poolEntry) markKey() string {
-	if e.st != "" {
-		return "st:" + e.st
-	}
-	return e.at
-}
-
-// TokenPool Token 池：支持 AT 直连，或通过 ST 自动续期。
+// TokenPool Token 池：持久化为 JSON；支持 AT、ST 或二者并存，ST 可自动续期 AT。
 type TokenPool struct {
 	mu           sync.Mutex
-	entries      []poolEntry
+	entries      []storedToken
 	errorKeys    map[string]bool
 	roundIdx     int
 	tokensFile   string
 	refreshAhead time.Duration
 }
 
-// NewTokenPool 创建并从文件加载 Token 池。
+// NewTokenPool 创建并从 JSON 文件加载 Token 池（兼容旧版行格式）。
 func NewTokenPool(tokensFile string, refreshAhead time.Duration) *TokenPool {
 	if refreshAhead <= 0 {
 		refreshAhead = 5 * time.Minute
@@ -79,64 +33,76 @@ func NewTokenPool(tokensFile string, refreshAhead time.Duration) *TokenPool {
 }
 
 func (tp *TokenPool) loadFromFile() {
-	f, err := os.Open(tp.tokensFile)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	var atN, stN int
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		at, st := parseTokenLine(scanner.Text())
-		if at == "" && st == "" {
-			continue
+	tokens := loadTokensFromFile(tp.tokensFile)
+	migrated := false
+	if len(tokens) == 0 && strings.HasSuffix(tp.tokensFile, ".json") {
+		legacy := strings.TrimSuffix(tp.tokensFile, ".json") + ".txt"
+		if legacy != tp.tokensFile {
+			if legacyTokens := loadTokensFromFile(legacy); len(legacyTokens) > 0 {
+				tokens = legacyTokens
+				migrated = true
+				log.Printf("[token-pool] 从旧文件 %s 迁移 %d 条凭证", legacy, len(tokens))
+			}
 		}
-		e := poolEntry{at: at, st: st}
-		if at != "" {
-			e.expiresAt = parseJWTExp(at)
+	}
+	var atN, stN int
+	for _, t := range tokens {
+		if t.AccessToken != "" {
 			atN++
 		}
-		if st != "" {
+		if t.SessionToken != "" {
 			stN++
 		}
-		tp.entries = append(tp.entries, e)
+		tp.entries = append(tp.entries, t)
 	}
-	log.Printf("[token-pool] 已加载 %d 条凭证 (AT=%d, ST=%d)", len(tp.entries), atN, stN)
+	if len(tp.entries) > 0 {
+		log.Printf("[token-pool] 已加载 %d 条凭证 (AT=%d, ST=%d) ← %s", len(tp.entries), atN, stN, tp.tokensFile)
+		if migrated {
+			_ = saveTokensToFile(tp.tokensFile, tp.entries)
+		}
+	}
 }
 
-func (tp *TokenPool) refreshEntry(e *poolEntry) (string, error) {
-	if e.st == "" {
-		if e.at == "" {
+func (tp *TokenPool) persistLocked() {
+	if err := saveTokensToFile(tp.tokensFile, tp.entries); err != nil {
+		log.Printf("[token-pool] 保存失败: %v", err)
+	}
+}
+
+func (tp *TokenPool) refreshEntry(e *storedToken) (string, error) {
+	if e.SessionToken == "" {
+		if e.AccessToken == "" {
 			return "", errors.New("no token")
 		}
-		return e.at, nil
+		return e.AccessToken, nil
 	}
-	at, exp, err := RefreshATFromSession(e.st)
+	at, exp, err := RefreshATFromSession(e.SessionToken)
 	if err != nil {
 		return "", err
 	}
-	e.at = at
-	e.expiresAt = exp
+	e.AccessToken = at
+	e.ExpiresAt = exp
+	e.UpdatedAt = time.Now()
 	log.Printf("[token-pool] ST→AT 刷新成功, 过期时间 %s", exp.Format(time.RFC3339))
+	tp.persistLocked()
 	return at, nil
 }
 
-func (tp *TokenPool) ensureFresh(e *poolEntry) (string, error) {
-	if e.st != "" {
-		need := e.at == "" || e.expiresAt.IsZero() || time.Now().Add(tp.refreshAhead).After(e.expiresAt)
+func (tp *TokenPool) ensureFresh(e *storedToken) (string, error) {
+	if e.SessionToken != "" {
+		need := e.AccessToken == "" || e.ExpiresAt.IsZero() || time.Now().Add(tp.refreshAhead).After(e.ExpiresAt)
 		if need {
 			return tp.refreshEntry(e)
 		}
-		return e.at, nil
+		return e.AccessToken, nil
 	}
-	if e.at == "" {
+	if e.AccessToken == "" {
 		return "", errors.New("empty access token")
 	}
-	if e.expiresAt.IsZero() {
-		e.expiresAt = parseJWTExp(e.at)
+	if e.ExpiresAt.IsZero() {
+		e.ExpiresAt = parseJWTExp(e.AccessToken)
 	}
-	return e.at, nil
+	return e.AccessToken, nil
 }
 
 // Pick 轮询选取可用 AT；含 ST 的条目会在过期前自动刷新。
@@ -152,13 +118,13 @@ func (tp *TokenPool) Pick() (string, bool) {
 	for i := 0; i < n; i++ {
 		idx := (tp.roundIdx + i) % n
 		e := &tp.entries[idx]
-		if tp.errorKeys[e.markKey()] {
+		if tp.errorKeys[e.dedupKey()] {
 			continue
 		}
 		at, err := tp.ensureFresh(e)
 		if err != nil {
-			log.Printf("[token-pool] 刷新失败 key=%s: %v", e.markKey(), err)
-			tp.errorKeys[e.markKey()] = true
+			log.Printf("[token-pool] 刷新失败 key=%s: %v", e.dedupKey(), err)
+			tp.errorKeys[e.dedupKey()] = true
 			continue
 		}
 		tp.roundIdx = (idx + 1) % n
@@ -174,10 +140,10 @@ func (tp *TokenPool) TryRefreshAT(currentAT string) (string, bool) {
 
 	for i := range tp.entries {
 		e := &tp.entries[i]
-		if e.st == "" {
+		if e.SessionToken == "" {
 			continue
 		}
-		if e.at != "" && e.at != currentAT {
+		if e.AccessToken != "" && e.AccessToken != currentAT {
 			continue
 		}
 		at, err := tp.refreshEntry(e)
@@ -185,54 +151,85 @@ func (tp *TokenPool) TryRefreshAT(currentAT string) (string, bool) {
 			log.Printf("[token-pool] 强制刷新失败: %v", err)
 			return "", false
 		}
-		delete(tp.errorKeys, e.markKey())
+		delete(tp.errorKeys, e.dedupKey())
 		return at, true
 	}
 	return "", false
 }
 
-// Add 添加凭证；ST 会以 st: 前缀写入文件。
-func (tp *TokenPool) Add(lines ...string) int {
+// mergeToken 将新凭证合并进已有条目（同 ST 或同 AT 则更新）。
+func mergeToken(existing *storedToken, incoming storedToken) {
+	if incoming.AccessToken != "" {
+		existing.AccessToken = incoming.AccessToken
+		existing.ExpiresAt = incoming.ExpiresAt
+		if existing.ExpiresAt.IsZero() {
+			existing.ExpiresAt = parseJWTExp(incoming.AccessToken)
+		}
+	}
+	if incoming.SessionToken != "" {
+		existing.SessionToken = incoming.SessionToken
+	}
+	existing.UpdatedAt = time.Now()
+	existing.assignID()
+}
+
+// Add 解析并添加凭证；整文件 JSON 重写保存（同时保留 access + session）。
+func (tp *TokenPool) Add(chunks ...string) int {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
 
-	added := 0
-	f, _ := os.OpenFile(tp.tokensFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer func() {
-		if f != nil {
-			_ = f.Close()
-		}
-	}()
-
-	existing := make(map[string]bool, len(tp.entries))
-	for _, e := range tp.entries {
-		existing[e.markKey()] = true
+	byKey := make(map[string]int, len(tp.entries))
+	for i, e := range tp.entries {
+		byKey[e.dedupKey()] = i
 	}
 
-	for _, raw := range lines {
-		at, st := parseTokenLine(raw)
-		if at == "" && st == "" {
+	added := 0
+	for _, raw := range chunks {
+		incoming, ok := parseCredentialInput(raw)
+		if !ok {
 			continue
 		}
-		e := poolEntry{at: at, st: st}
-		if at != "" {
-			e.expiresAt = parseJWTExp(at)
-		}
-		key := e.markKey()
-		if existing[key] {
+
+		key := incoming.dedupKey()
+		if key == "" {
 			continue
 		}
-		tp.entries = append(tp.entries, e)
-		existing[key] = true
-		added++
-		if f != nil {
-			if st != "" {
-				// 有 ST：只持久化 st: 行（下次启动时 AT 靠 ST 换，无需存旧 AT）
-				_, _ = f.WriteString("st:" + st + "\n")
-			} else {
-				_, _ = f.WriteString(at + "\n")
+
+		// 同 session 或同 access 则更新，避免重复条目
+		merged := false
+		for i := range tp.entries {
+			e := &tp.entries[i]
+			if incoming.SessionToken != "" && e.SessionToken == incoming.SessionToken {
+				mergeToken(e, incoming)
+				byKey[e.dedupKey()] = i
+				merged = true
+				break
+			}
+			if incoming.AccessToken != "" && e.AccessToken == incoming.AccessToken {
+				mergeToken(e, incoming)
+				byKey[e.dedupKey()] = i
+				merged = true
+				break
 			}
 		}
+		if merged {
+			added++
+			delete(tp.errorKeys, key)
+			continue
+		}
+
+		if _, dup := byKey[key]; dup {
+			continue
+		}
+
+		tp.entries = append(tp.entries, incoming)
+		byKey[key] = len(tp.entries) - 1
+		added++
+		delete(tp.errorKeys, key)
+	}
+
+	if added > 0 || len(tp.entries) > 0 {
+		tp.persistLocked()
 	}
 	return added
 }
@@ -244,7 +241,7 @@ func (tp *TokenPool) Clear() {
 	tp.entries = nil
 	tp.errorKeys = make(map[string]bool)
 	tp.roundIdx = 0
-	_ = os.WriteFile(tp.tokensFile, []byte{}, 0644)
+	_ = saveTokensToFile(tp.tokensFile, nil)
 }
 
 // MarkError 标记失效（按当前 AT 匹配条目）。
@@ -252,12 +249,12 @@ func (tp *TokenPool) MarkError(at string) {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
 	for i := range tp.entries {
-		if tp.entries[i].at == at {
-			tp.errorKeys[tp.entries[i].markKey()] = true
+		if tp.entries[i].AccessToken == at {
+			tp.errorKeys[tp.entries[i].dedupKey()] = true
 			return
 		}
 	}
-	tp.errorKeys[at] = true
+	tp.errorKeys["at:"+at] = true
 }
 
 // Stats 返回 total / valid / errored。
@@ -273,7 +270,7 @@ func (tp *TokenPool) Stats() (total, valid, errored int) {
 	return
 }
 
-// ErrorTokens 返回失效条目的 markKey 列表。
+// ErrorTokens 返回失效条目的 dedupKey 列表。
 func (tp *TokenPool) ErrorTokens() []string {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()

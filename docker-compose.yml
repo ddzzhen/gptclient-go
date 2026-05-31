@@ -18,7 +18,7 @@ services:
       SESSION_TTL_MINUTES: "120"
     volumes:
       # 持久化 tokens 和图片
-      - ./tokens.txt:/app/tokens.txt
+      - ./tokens.json:/app/tokens.json
       - ./images:/app/images
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:5005/health"]

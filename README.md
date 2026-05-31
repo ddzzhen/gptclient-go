@@ -139,7 +139,7 @@ docker build -t sentinel-go .
 docker run -d \
   -p 5005:5005 \
   -e AUTHORIZATION="your-api-key" \
-  -v $(pwd)/tokens.txt:/app/tokens.txt \
+  -v $(pwd)/tokens.json:/app/tokens.json \
   -v $(pwd)/images:/app/images \
   sentinel-go
 ```
@@ -160,7 +160,7 @@ docker compose up -d
 | `DEFAULT_MODEL` | `gpt-5-5-thinking` | 默认模型 |
 | `TEMP_MODE` | `false` | 临时模式（不保存对话历史） |
 | `IMAGE_DIR` | `images` | 图片保存目录 |
-| `TOKENS_FILE` | `tokens.txt` | Token 持久化文件路径 |
+| `TOKENS_FILE` | `tokens.json` | Token 持久化文件路径（JSON，含 access + session） |
 | `SESSION_TTL_MINUTES` | `120` | Session 不活跃超时（分钟） |
 
 ### Token 管理
@@ -176,15 +176,35 @@ docker compose up -d
 | `GET  /tokens/errors` | 查看失效 Token 列表 |
 | `GET  /health` | 健康检查 |
 
-**`tokens.txt` 格式（每行一个）：**
+**`tokens.json` 持久化格式：**
 
-```
-eyJhbGci...                              # Access Token（JWT）
-st:你的__Secure-next-auth.session-token   # Session Token（推荐，自动续期 AT）
-{"user":{...},"accessToken":"eyJ..."}     # 从 /api/auth/session 复制的完整 JSON
+```json
+{
+  "version": 1,
+  "tokens": [
+    {
+      "id": "a1b2c3",
+      "access_token": "eyJhbGciOiJS...",
+      "session_token": "eyJhbGciOiJkaXIi...",
+      "expires_at": "2026-08-29T10:19:02Z",
+      "updated_at": "2026-05-31T12:00:00Z"
+    }
+  ]
+}
 ```
 
-配置 `TOKEN_REFRESH_AHEAD_SEC`（默认 300）可在 AT 过期前提前用 ST 换新。池模式请求若遇 401 会自动尝试刷新一次。
+**上传/import 支持的文本格式（每行一条，或整段 session JSON）：**
+
+| 格式 | 示例 |
+|------|------|
+| 仅 Access | `eyJhbGciOiJS...` |
+| Access + Session | `eyJhbGciOiJS...----eyJhbGciOiJkaXIi...`（四个 `-`） |
+| 仅 Session | `eyJhbGciOiJkaXIi...` 或 `st:...` |
+| Session API JSON | 从 `/api/auth/session` 复制的整段 JSON |
+
+首次启动若仅有旧版 `tokens.txt`（按行 `st:` / JWT），会自动迁移到 `tokens.json`。
+
+配置 `TOKEN_REFRESH_AHEAD_SEC`（默认 300）可在 AT 过期前提前用 ST 换新；刷新后会写回 JSON。池模式请求若遇 401 会自动尝试刷新一次。
 
 ### API 兼容性说明
 
@@ -309,6 +329,7 @@ client.SetDisableAutoImage(true)
 
 ```gitignore
 config.json
+tokens.json
 tokens.txt
 images/
 ```
