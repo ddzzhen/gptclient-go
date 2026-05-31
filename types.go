@@ -43,9 +43,13 @@ type ChatResult struct {
 	SandboxArtifacts   []SandboxArtifact // Code Interpreter 沙箱产物（pdf/txt/等）
 	PDFArtifacts       []PDFArtifact     // 兼容：.pdf 子集，与 SandboxArtifacts 同步填充
 	emittedArtifacts   map[string]bool              // 已推送的产物键（防重复）
-	lastImageAddedAt   int64                        // 纳秒时间戳，多图 idle 结束用（仅 DALL·E 产出更新）
-	imageSlots         map[string]*GeneratedImageSlot // gen_id/message_id → 图位
-	imageAsyncTaskActive bool                         // 已收到 async-task-start，WS 应等待 conversation-update
+	lastImageAddedAt       int64  // 纳秒，最近一次 DALL·E file_id 更新时间
+	lastImageGenActivityAt int64  // 纳秒，生图相关任意活动（图/async-task/turn WS）— idle 据此判断
+	imageSlots             map[string]*GeneratedImageSlot
+	imageAsyncTaskActive      bool // 仍有进行中的 image_gen async task
+	imageAsyncTaskPending     int  // async-task-start 与 complete/end 计数
+	imageGenAsyncCompleteSeen bool // 已收到 async-task-complete/end
+	imageGenTurnDone          bool // turn topic WS 流已 [DONE]
 }
 
 // SessionInfo 当前会话状态快照

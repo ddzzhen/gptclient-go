@@ -55,6 +55,9 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 
 	// 获取或创建 session（有状态多轮对话）
 	entry := h.session.GetOrCreate(req.ConversationID, token)
+	if req.ConversationID != "" {
+		h.session.Register(req.ConversationID, entry)
+	}
 
 	// 如果有 system prompt 且是新对话（无 conversationID），拼接到用户消息前面
 	inputMsg := userMsg
@@ -180,6 +183,16 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		})
 	}
 
+	registerSessionForConv := func(convID string) {
+		if convID == "" {
+			return
+		}
+		registeredConvID = convID
+		h.session.Register(convID, entry)
+		opts.Artifacts = h.buildArtifactConfig(c, req, convID, writeSentinel)
+	}
+	opts.OnConversationID = registerSessionForConv
+	registerSessionForConv(reqConvID)
 	opts.Artifacts = h.buildArtifactConfig(c, req, registeredConvID, writeSentinel)
 
 	handler := func(delta string) {
@@ -238,11 +251,8 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 		return
 	}
 
-	// 注册 session
 	if result.ConversationID != "" {
-		registeredConvID = result.ConversationID
-		h.session.Register(registeredConvID, entry)
-		opts.Artifacts = h.buildArtifactConfig(c, req, registeredConvID, writeSentinel)
+		registerSessionForConv(result.ConversationID)
 	}
 
 	sentinel.LogContentPreview(func(format string, args ...interface{}) {
@@ -367,6 +377,20 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts sentinel.ChatOptions, req ChatCompletionRequest, reqConvID, chatID, model string, created int64) {
 	var sentinelEvents []sentinel.StreamEvent
 	convForArt := reqConvID
+	registerSessionForConv := func(convID string) {
+		if convID == "" {
+			return
+		}
+		convForArt = convID
+		h.session.Register(convID, entry)
+		opts.Artifacts = h.buildArtifactConfig(c, req, convID, func(ev sentinel.StreamEvent) {
+			sentinelEvents = append(sentinelEvents, ev)
+		})
+	}
+	opts.OnConversationID = registerSessionForConv
+	if reqConvID != "" {
+		registerSessionForConv(reqConvID)
+	}
 	opts.Artifacts = h.buildArtifactConfig(c, req, convForArt, func(ev sentinel.StreamEvent) {
 		sentinelEvents = append(sentinelEvents, ev)
 	})
@@ -379,13 +403,8 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 		return
 	}
 
-	// 注册 session
 	if result.ConversationID != "" {
-		h.session.Register(result.ConversationID, entry)
-		convForArt = result.ConversationID
-		opts.Artifacts = h.buildArtifactConfig(c, req, convForArt, func(ev sentinel.StreamEvent) {
-			sentinelEvents = append(sentinelEvents, ev)
-		})
+		registerSessionForConv(result.ConversationID)
 	}
 
 	if result.ExpectGeneratedImages {

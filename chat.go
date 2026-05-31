@@ -35,6 +35,8 @@ type ChatOptions struct {
 	ImageAspect ImageAspectRatio
 	// Artifacts 产物（生图/沙箱文件）流式侧信道；正文仍走 StreamHandler
 	Artifacts ArtifactStreamConfig
+	// OnConversationID 首次得知 conversation_id 时回调（server 用于提前 Register，以便流中即可拉取 /api/image/proxy）
+	OnConversationID func(convID string)
 }
 
 // Chat 发送一轮对话，返回完整结果（非流式）
@@ -341,9 +343,7 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 			c.logf("[debug-sse] payload: %s", payload)
 		}
 
-		if cid, ok := evt["conversation_id"].(string); ok && cid != "" {
-			result.ConversationID = cid
-		}
+		c.noteConversationID(result, opts, evt)
 
 		evtType, _ := evt["type"].(string)
 		switch evtType {
@@ -430,6 +430,21 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 	return result, nil
 }
 
+func (c *Client) noteConversationID(result *ChatResult, opts ChatOptions, evt map[string]interface{}) {
+	if result == nil || evt == nil {
+		return
+	}
+	cid, ok := evt["conversation_id"].(string)
+	if !ok || cid == "" {
+		return
+	}
+	prev := result.ConversationID
+	result.ConversationID = cid
+	if prev != cid && opts.OnConversationID != nil {
+		opts.OnConversationID(cid)
+	}
+}
+
 // parseWSFrames 将 WebSocket 文本帧解析为帧列表（支持 JSON 数组或单对象）
 func parseWSFrames(raw []byte) []map[string]interface{} {
 	if len(raw) == 0 {
@@ -449,12 +464,65 @@ func parseWSFrames(raw []byte) []map[string]interface{} {
 	return []map[string]interface{}{single}
 }
 
+func (c *Client) bumpImageGenActivity(result *ChatResult) {
+	if result == nil {
+		return
+	}
+	result.lastImageGenActivityAt = time.Now().UnixNano()
+}
+
+func isImageAsyncWSUpdate(updateType string) bool {
+	if strings.HasPrefix(updateType, "async-task-") {
+		return true
+	}
+	switch updateType {
+	case "add-messages", "insert-message", "update-message":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) trackImageAsyncTaskUpdate(result *ChatResult, updateType string) {
+	if result == nil || updateType == "" || !isImageAsyncWSUpdate(updateType) {
+		return
+	}
+	c.bumpImageGenActivity(result)
+	switch updateType {
+	case "async-task-start":
+		result.imageAsyncTaskPending++
+		result.imageAsyncTaskActive = true
+		c.logf("[image-ws][async] start pending=%d", result.imageAsyncTaskPending)
+	case "async-task-complete", "async-task-end", "async-task-finished", "async-task-stop", "async-task-done", "async-task-success":
+		result.imageGenAsyncCompleteSeen = true
+		if result.imageAsyncTaskPending > 0 {
+			result.imageAsyncTaskPending--
+		}
+		if result.imageAsyncTaskPending <= 0 {
+			result.imageAsyncTaskPending = 0
+			result.imageAsyncTaskActive = false
+		}
+		c.logf("[image-ws][async] complete type=%s pending=%d active=%v", updateType, result.imageAsyncTaskPending, result.imageAsyncTaskActive)
+	default:
+		// add-messages / update-message：仅刷新活动时间，不增加 pending（避免无 complete 时永久卡住）
+		c.logf("[image-ws][async] progress type=%s pending=%d active=%v", updateType, result.imageAsyncTaskPending, result.imageAsyncTaskActive)
+	}
+}
+
 // processConvUpdatePayload 处理 conversation-update 的 payload（生图可多图，不在此结束 WS）。
 func (c *Client) processConvUpdatePayload(payload map[string]interface{}, result *ChatResult, opts ChatOptions, handler StreamHandler) {
 	result.ExpectGeneratedImages = IsGeneratedImageTurn(result.ArtifactSignals, opts)
 	updateType, _ := payload["update_type"].(string)
-	if updateType == "async-task-start" {
-		result.imageAsyncTaskActive = true
+	c.trackImageAsyncTaskUpdate(result, updateType)
+	summary := summarizeConvUpdatePayload(payload)
+	if summary != "" {
+		c.logf("[image-ws][evt] %s pending=%d slots=%d", summary, result.imageAsyncTaskPending, len(result.imageSlots))
+	}
+	if updateType != "" && !isImageAsyncWSUpdate(updateType) {
+		lower := strings.ToLower(updateType)
+		if strings.Contains(lower, "complete") || strings.Contains(lower, "end") || strings.Contains(lower, "finish") {
+			c.logf("[image-ws][evt] 未识别的结束类事件 type=%s（请反馈完整 update_type）", updateType)
+		}
 	}
 	updateContent, ok := payload["update_content"].(map[string]interface{})
 	if !ok {
@@ -597,21 +665,34 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 
 	waitStart := time.Now()
 	lastProgress := time.Now()
+	lastDiag := time.Now()
+	c.logImageGenDiag(result, "ws_loop_start")
 	for {
 		if time.Now().After(deadline) {
+			c.logImageGenDiag(result, "timeout")
 			return fmt.Errorf("超过最大等待时间 %.0f 分钟，图片未返回", totalTimeout.Minutes())
 		}
-		idle := ImageGenIdleDuration(result)
-		if result.HasDalleGeneratedOutput() && result.lastImageAddedAt > 0 {
-			if time.Since(time.Unix(0, result.lastImageAddedAt)) >= idle {
-				c.FinishImageGenWS(result, opts)
-				c.logf("[image-ws] 生图收齐 %d 槽（idle %.0fs）", len(result.imageSlots), idle.Seconds())
-				return nil
-			}
+		if cleared := result.MaybeClearStaleImageAsyncPending(); cleared {
+			c.logf("[image-ws][async] 长期无 complete，已清除 stale pending（有图且 idle≥20s）")
+			c.logImageGenDiag(result, "stale_pending_cleared")
+		}
+		if result.CanImageGenIdleExit() {
+			idle := ImageGenIdleDuration(result)
+			c.FinishImageGenWS(result, opts)
+			c.logf("[image-ws] 生图收齐 %d 槽（idle %.0fs pending=%d active=%v complete=%v turnDone=%v）",
+				len(result.imageSlots), idle.Seconds(), result.imageAsyncTaskPending, result.imageAsyncTaskActive,
+				result.imageGenAsyncCompleteSeen, result.imageGenTurnDone)
+			c.logImageGenDiag(result, "exit_ok")
+			return nil
 		}
 		if time.Since(lastProgress) >= 15*time.Second {
-			c.logf("[image-ws] 等待 picture file_id 中... 已等待 %ds", int(time.Since(waitStart).Seconds()))
+			c.logf("[image-ws] 等待生图中... 已等待 %ds | %s",
+				int(time.Since(waitStart).Seconds()), result.ImageGenExitBlockReason())
 			lastProgress = time.Now()
+		}
+		if time.Since(lastDiag) >= 30*time.Second {
+			c.logImageGenDiag(result, "heartbeat")
+			lastDiag = time.Now()
 		}
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -649,7 +730,9 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 					c.logf("[ws] reply catchups=%d", len(catchups))
 					for _, cu := range catchups {
 						if msg, ok := cu.(map[string]interface{}); ok {
-							c.processWSMessage(msg, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
+							if c.processWSMessage(msg, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent) {
+								result.imageGenTurnDone = true
+							}
 						}
 					}
 				}
@@ -658,7 +741,10 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 				if frameTopic != turnTopicID {
 					continue
 				}
-				c.processWSMessage(frame, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
+				if c.processWSMessage(frame, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent) {
+					result.imageGenTurnDone = true
+					c.logf("[image-ws] turn topic 流已 [DONE]")
+				}
 			}
 		}
 		c.MergeApplyAndEmitArtifacts(result, opts)
@@ -821,12 +907,9 @@ func (c *Client) subscribeWSConvUpdate(conn *websocket.Conn, conversationID stri
 		if time.Now().After(deadline) {
 			return fmt.Errorf("超过最大等待时间 %.0f 分钟，图片未返回", totalTimeout.Minutes())
 		}
-		idle := ImageGenIdleDuration(result)
-		if result.HasDalleGeneratedOutput() && result.lastImageAddedAt > 0 {
-			if time.Since(time.Unix(0, result.lastImageAddedAt)) >= idle {
-				c.FinishImageGenWS(result, opts)
-				return nil
-			}
+		if result.CanImageGenIdleExit() {
+			c.FinishImageGenWS(result, opts)
+			return nil
 		}
 
 		_, raw, err := conn.ReadMessage()
@@ -898,9 +981,7 @@ func (c *Client) processWSMessage(frame map[string]interface{}, result *ChatResu
 		result.ArtifactSignals = MergeSignals(result.ArtifactSignals, ExtractSignalsFromJSON(evt))
 		c.MergeApplyAndEmitArtifacts(result, opts)
 
-		if cid, ok := evt["conversation_id"].(string); ok && cid != "" {
-			result.ConversationID = cid
-		}
+		c.noteConversationID(result, opts, evt)
 
 		evtType, _ := evt["type"].(string)
 		if evtType == "resume_conversation_token" || evtType == "stream_handoff" {

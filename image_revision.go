@@ -147,7 +147,6 @@ func (c *Client) noteGeneratedImageRevision(result *ChatResult, opts ChatOptions
 		result.ImageFileIDs = append(result.ImageFileIDs, p.FileID)
 	}
 	result.ImageFileID = p.FileID
-	result.lastImageAddedAt = time.Now().UnixNano()
 
 	emitKey := "img:" + p.FileID
 	if result.emittedArtifacts[emitKey] {
@@ -170,10 +169,19 @@ func (c *Client) noteGeneratedImageRevision(result *ChatResult, opts ChatOptions
 		return
 	}
 
+	now := time.Now().UnixNano()
+	result.lastImageAddedAt = now
+	result.lastImageGenActivityAt = now
+
 	slot.Revision++
 	slot.FileHistory = append(slot.FileHistory, p.FileID)
 	slot.FileID = p.FileID
 	slot.Final = false
+
+	// 诊断：新图修订（重复 file_id 已在上方 return）
+	if c != nil {
+		c.logf("[image-ws][img] %s slot=%d rev=%d gen=%s file=%s", wsUpdateType, slot.SlotIndex, slot.Revision, p.GenID, p.FileID)
+	}
 
 	mode := opts.Artifacts.imageRevisionMode()
 	cfg := opts.Artifacts.normalized()
@@ -312,12 +320,37 @@ func (result *ChatResult) AllImageSlotsFinal() bool {
 	return true
 }
 
-// ImageGenIdleDuration 多图候选（需用户选择）时延长 idle。
+// ImageGenIdleDuration 无新活动后等待多久再结束 WS（网页端修图/多轮 async 需更久）。
 func ImageGenIdleDuration(result *ChatResult) time.Duration {
-	if result != nil && len(result.imageSlots) >= 2 && !result.AllImageSlotsFinal() {
+	if result == nil {
+		return 15 * time.Second
+	}
+	if result.imageAsyncTaskPending > 0 || result.imageAsyncTaskActive {
+		return 25 * time.Second
+	}
+	if len(result.imageSlots) >= 2 && !result.AllImageSlotsFinal() {
 		return 30 * time.Second
 	}
-	return 4 * time.Second
+	return 15 * time.Second
+}
+
+// CanImageGenIdleExit 是否允许结束生图 WS（优先服务端 complete / turn [DONE]，辅以 idle）。
+func (result *ChatResult) CanImageGenIdleExit() bool {
+	if result == nil || !result.HasDalleGeneratedOutput() || result.lastImageGenActivityAt == 0 {
+		return false
+	}
+	result.MaybeClearStaleImageAsyncPending()
+	if result.imageAsyncTaskPending > 0 {
+		return false
+	}
+	since := time.Since(time.Unix(0, result.lastImageGenActivityAt))
+	if result.imageGenAsyncCompleteSeen {
+		return since >= 3*time.Second
+	}
+	if result.imageGenTurnDone {
+		return since >= 5*time.Second
+	}
+	return since >= ImageGenIdleDuration(result)
 }
 
 // RebuildImageFileIDsFromSlots 按槽位顺序刷新 ImageFileIDs（最终每槽最新 file_id）。

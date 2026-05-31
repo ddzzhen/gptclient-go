@@ -457,7 +457,10 @@ try {
 | 生图 | `GET /api/image/proxy?conv_id={conversation_id}&file_id={file_id}` |
 | 沙箱文件 | `GET /api/pdf/proxy?conv_id={conversation_id}&msg_id={message_id}&sandbox_path={path}` |
 
-需携带与聊天接口相同的鉴权（同源或配置 CORS）。
+代理依赖服务端内存中的 **session**（`conv_id` → 本轮 ChatGPT token）。须在收到 `conversation_id` 之后、且与发起聊天的**同一 server 进程**内请求。
+
+- 流式过程中收到 `sentinel.url` 即可下载（服务端会在首次拿到 `conversation_id` 时注册 session）。
+- 若仍报 `Session not found or expired`：确认 `conv_id` 与当轮 `stop` chunk 一致；未重启 server；或改用 `artifact_delivery: base64` 免代理。
 
 ---
 
@@ -499,6 +502,25 @@ go run ./cmd/stream-capture/ -config config.json -case image
 - 无 `[image-ws] 生图收齐` 行
 
 修复后：仅带 `dalle.gen_id` 的 WS 更新才计入 idle；多图候选 idle 延长至 30s。
+
+### 网页还在生图但 API 已返回
+
+原因：首张图出来后 **4s 无新图** 就结束 WS，但 ChatGPT 常继续 `async-task` 修图/多轮（`add-messages` 等）。
+
+修复后：
+
+- 默认 idle **15s**（async 进行中 **25s**，多图候选 **30s**）
+- 仅 `async-task-start` 增加 `pending`；`add-messages` **不**增加 pending（避免无 complete 时永久卡住）
+- 有图且 **20s** 无新图、仍无 `complete` 时自动 `stale pending` 清除
+- 服务端日志前缀：`[image-ws][evt]` / `[async]` / `[img]` / `[diag]`，`block=` 说明为何还不能结束
+
+示例：
+
+```text
+[image-ws] 等待生图中... 已等待 83s | blocking=async_pending(1,active=true) idleSinceImg=12.3s
+[image-ws][async] 长期无 complete，已清除 stale pending（有图且 idle≥20s）
+[image-ws][diag] exit_ok ... block=ok
+```
 
 ---
 
