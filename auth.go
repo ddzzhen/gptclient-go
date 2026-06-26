@@ -132,10 +132,9 @@ func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error
 		var ok bool
 		proofToken, ok = SolveProofToken(seed, difficulty, c.userAgent)
 		if !ok {
-			c.logf("  [pow] fallback used after %dms difficulty=%s", time.Since(s0).Milliseconds(), difficulty)
-		} else {
-			c.logf("  [pow] solved in %dms", time.Since(s0).Milliseconds())
+			return "", "", NewUpstreamError(ErrSentinelPoWFailed, "sentinel proof-of-work solving failed", 0, "", nil)
 		}
+		c.logf("  [pow] solved in %dms", time.Since(s0).Milliseconds())
 	}
 
 	fb := map[string]interface{}{

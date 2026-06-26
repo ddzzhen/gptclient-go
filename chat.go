@@ -851,7 +851,7 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 				c.logf("[ws] read ended after final body: %v", err)
 				return nil
 			}
-			if reconnectAttempts < 2 {
+			if reconnectAttempts < 1 {
 				reconnectAttempts++
 				c.logf("[ws] read failed, reconnecting attempt=%d: %v", reconnectAttempts, err)
 				_ = conn.Close()

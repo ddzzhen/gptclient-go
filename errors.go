@@ -72,6 +72,9 @@ func (e *UpstreamError) Unwrap() error {
 func NewUpstreamError(code ErrorCode, message string, status int, body string, cause error) *UpstreamError {
 	ue := &UpstreamError{Code: code, Message: message, StatusCode: status, Body: truncateStr(body, 500), Cause: cause}
 	ue.Retryable = isRetryableCode(code) || status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+	if status == http.StatusForbidden {
+		ue.Retryable = false
+	}
 	return ue
 }
 
@@ -93,7 +96,7 @@ func ClassifyHTTPError(context string, status int, body string, retryAfterHeader
 	}
 	ue := NewUpstreamError(code, msg, status, body, nil)
 	ue.RetryAfter = parseRetryAfter(retryAfterHeader)
-	if ue.RetryAfter > 0 {
+	if ue.RetryAfter > 0 && status == http.StatusTooManyRequests {
 		ue.Retryable = true
 	}
 	return ue
@@ -116,7 +119,7 @@ func classifyForbiddenBody(lower string) ErrorCode {
 
 func isRetryableCode(code ErrorCode) bool {
 	switch code {
-	case ErrUpstreamRateLimited, ErrUpstreamForbidden, ErrSentinelPrepareFailed, ErrSentinelFinalizeFailed, ErrWSDisconnected:
+	case ErrUpstreamRateLimited:
 		return true
 	default:
 		return false
