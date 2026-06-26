@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	sentinel "sentinel-go"
 )
 
 // NewRouter 创建并配置 Gin 路由器
@@ -22,10 +24,11 @@ func NewRouter(cfg *ServerConfig, pool *TokenPool, session *SessionManager) *gin
 	r.GET("/health", func(c *gin.Context) {
 		total, valid, _ := pool.Stats()
 		c.JSON(http.StatusOK, gin.H{
-			"status":          "ok",
-			"tokens_total":    total,
-			"tokens_valid":    valid,
-			"active_sessions": session.Count(),
+			"status":               "ok",
+			"tokens_total":         total,
+			"tokens_valid":         valid,
+			"active_sessions":      session.Count(),
+			"sentinel_diagnostics": sentinel.GetSentinelDiagnostics(),
 		})
 	})
 
