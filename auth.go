@@ -3,6 +3,7 @@ package sentinel
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -15,12 +16,12 @@ func (c *Client) getConduitToken(model, turnTraceID, partialText string) (string
 	body := map[string]interface{}{
 		"action":                "next",
 		"fork_from_shared_post": false,
-		"parent_message_id":    "client-created-root",
-		"model":                model,
-		"timezone_offset_min":  -480,
-		"timezone":             "Asia/Shanghai",
-		"conversation_mode":    map[string]string{"kind": "primary_assistant"},
-		"system_hints":         []string{},
+		"parent_message_id":     "client-created-root",
+		"model":                 model,
+		"timezone_offset_min":   -480,
+		"timezone":              "Asia/Shanghai",
+		"conversation_mode":     map[string]string{"kind": "primary_assistant"},
+		"system_hints":          []string{},
 		"partial_query": map[string]interface{}{
 			"id":     GenerateUUID(),
 			"author": map[string]string{"role": "user"},
@@ -29,35 +30,43 @@ func (c *Client) getConduitToken(model, turnTraceID, partialText string) (string
 				"parts":        []string{partialText},
 			},
 		},
-		"supports_buffering":    true,
-		"supported_encodings":   []string{"v1"},
+		"supports_buffering":     true,
+		"supported_encodings":    []string{"v1"},
 		"client_contextual_info": map[string]interface{}{"app_name": "chatgpt.com"},
-		"thinking_effort":       "standard",
+		"thinking_effort":        "standard",
 	}
 
-	resp, err := c.httpClient.R().
-		SetHeaders(map[string]string{
-			"Accept":                 "*/*",
-			"Content-Type":           "application/json",
-			"x-conduit-token":        "no-token",
-			"x-oai-turn-trace-id":    turnTraceID,
-			"x-openai-target-path":   "/backend-api/f/conversation/prepare",
-			"x-openai-target-route":  "/backend-api/f/conversation/prepare",
-		}).
-		SetBody(body).
-		Post("/backend-api/f/conversation/prepare")
+	var respBody []byte
+	err := c.doWithRetry("conversation/prepare", func() error {
+		resp, err := c.httpClient.R().
+			SetHeaders(map[string]string{
+				"Accept":                "*/*",
+				"Content-Type":          "application/json",
+				"x-conduit-token":       "no-token",
+				"x-oai-turn-trace-id":   turnTraceID,
+				"x-openai-target-path":  "/backend-api/f/conversation/prepare",
+				"x-openai-target-route": "/backend-api/f/conversation/prepare",
+			}).
+			SetBody(body).
+			Post("/backend-api/f/conversation/prepare")
+		if err != nil {
+			return fmt.Errorf("conversation/prepare request: %w", err)
+		}
+		respBody = resp.Bytes()
+		if resp.StatusCode != 200 {
+			return ClassifyHTTPError("conversation/prepare", resp.StatusCode, resp.String(), resp.Header.Get("Retry-After"))
+		}
+		return nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("conversation/prepare request: %w", err)
-	}
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("conversation/prepare %d: %s", resp.StatusCode, truncateStr(resp.String(), 200))
+		return "", err
 	}
 
 	var result struct {
 		Status       string `json:"status"`
 		ConduitToken string `json:"conduit_token"`
 	}
-	if err := json.Unmarshal(resp.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", fmt.Errorf("parse conduit response: %w", err)
 	}
 
@@ -86,7 +95,9 @@ func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error
 		return "", "", fmt.Errorf("sentinel/prepare request: %w", err)
 	}
 	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("sentinel/prepare %d: %s", resp.StatusCode, truncateStr(resp.String(), 200))
+		ue := ClassifyHTTPError("sentinel/prepare", resp.StatusCode, resp.String(), resp.Header.Get("Retry-After"))
+		ue.Code = ErrSentinelPrepareFailed
+		return "", "", ue
 	}
 
 	var pd struct {
@@ -109,13 +120,22 @@ func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error
 	turnstileRequired := pd.Turnstile != nil && pd.Turnstile.Required
 	c.logf("  [sentinel] persona=%s, PoW=%v, turnstile=%v", pd.Persona, powRequired, turnstileRequired)
 
+	if turnstileRequired {
+		return "", "", NewUpstreamError(ErrSentinelTurnstileRequired, "sentinel turnstile challenge is required but no solver is configured", http.StatusForbidden, truncateStr(resp.String(), 500), nil)
+	}
+
 	if powRequired {
 		seed := pd.Proofofwork.Seed
 		difficulty := pd.Proofofwork.Difficulty
 		s0 := time.Now()
 
-		proofToken = SolveProofToken(seed, difficulty, c.userAgent)
-		c.logf("  [pow] solved in %dms", time.Since(s0).Milliseconds())
+		var ok bool
+		proofToken, ok = SolveProofToken(seed, difficulty, c.userAgent)
+		if !ok {
+			c.logf("  [pow] fallback used after %dms difficulty=%s", time.Since(s0).Milliseconds(), difficulty)
+		} else {
+			c.logf("  [pow] solved in %dms", time.Since(s0).Milliseconds())
+		}
 	}
 
 	fb := map[string]interface{}{
@@ -138,7 +158,9 @@ func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error
 		return "", "", fmt.Errorf("sentinel/finalize request: %w", err)
 	}
 	if finResp.StatusCode != 200 {
-		return "", "", fmt.Errorf("sentinel/finalize %d: %s", finResp.StatusCode, truncateStr(finResp.String(), 200))
+		ue := ClassifyHTTPError("sentinel/finalize", finResp.StatusCode, finResp.String(), finResp.Header.Get("Retry-After"))
+		ue.Code = ErrSentinelFinalizeFailed
+		return "", "", ue
 	}
 
 	var fd struct {

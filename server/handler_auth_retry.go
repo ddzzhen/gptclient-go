@@ -12,6 +12,9 @@ func isAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if sentinel.IsErrorCode(err, sentinel.ErrAuthInvalidAccessToken) || sentinel.IsErrorCode(err, sentinel.ErrAuthCookieInvalid) {
+		return true
+	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "401") ||
 		strings.Contains(s, "unauthorized") ||
@@ -55,7 +58,7 @@ func (h *ChatHandler) retryAfterRefresh(
 	newAT, ok := h.pool.TryRefreshAT(oldAT)
 	if !ok {
 		h.pool.MarkError(oldAT)
-		return nil, firstErr
+		return nil, sentinel.NewUpstreamError(sentinel.ErrAuthSessionRefreshFailed, "session token refresh failed", 0, "", firstErr)
 	}
 	entry.client.SetBearerToken(newAT)
 	entry.token = newAT

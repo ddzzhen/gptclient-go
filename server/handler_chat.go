@@ -134,10 +134,10 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 
 func (h *ChatHandler) buildArtifactConfig(c *gin.Context, req ChatCompletionRequest, convID string, onEvent func(sentinel.StreamEvent)) sentinel.ArtifactStreamConfig {
 	return sentinel.ArtifactStreamConfig{
-		Delivery:         req.ArtifactDelivery,
-		ChunkSize:        req.ArtifactBase64ChunkSize,
-		ImageRevisions:   req.ArtifactImageRevisions,
-		OnEvent:          onEvent,
+		Delivery:       req.ArtifactDelivery,
+		ChunkSize:      req.ArtifactBase64ChunkSize,
+		ImageRevisions: req.ArtifactImageRevisions,
+		OnEvent:        onEvent,
 		BuildImageURL: func(fileID string) string {
 			rel := fmt.Sprintf("/api/image/proxy?conv_id=%s&file_id=%s", convID, fileID)
 			return buildAbsoluteURL(c, h.cfg, rel)
@@ -178,7 +178,7 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 	writeSentinel := func(ev sentinel.StreamEvent) {
 		writeChunk(ChatCompletionChunk{
 			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []ChunkChoice{{Index: 0, Delta: Delta{}, FinishReason: nil}},
+			Choices:  []ChunkChoice{{Index: 0, Delta: Delta{}, FinishReason: nil}},
 			Sentinel: &ev,
 		})
 	}
@@ -243,8 +243,9 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 			tokenPreview = entry.token
 		}
 		fmt.Printf("[chat-err] token=%s error=%v\n", tokenPreview, err)
-		errChunk := fmt.Sprintf("data: {\"error\":{\"message\":%q,\"type\":\"server_error\"}}\n\n", err.Error())
-		_, _ = io.WriteString(w, errChunk)
+		_, errResp := errorResponseFromError(err)
+		data, _ := json.Marshal(errResp)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 		if canFlush {
 			flusher.Flush()
 		}
@@ -334,20 +335,20 @@ func (h *ChatHandler) handleStream(c *gin.Context, entry *sessionEntry, opts sen
 
 	if req.ArtifactMarkdown {
 		if files := sandboxFilesForHandler(result); len(files) > 0 {
-		var fileContent strings.Builder
-		for i, f := range files {
-			relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
-				registeredConvID, f.MessageID, url.QueryEscape(f.SandboxPath))
-			label := f.FileName
-			if label == "" {
-				label = fmt.Sprintf("file_%d", i+1)
+			var fileContent strings.Builder
+			for i, f := range files {
+				relURL := fmt.Sprintf("/api/pdf/proxy?conv_id=%s&msg_id=%s&sandbox_path=%s",
+					registeredConvID, f.MessageID, url.QueryEscape(f.SandboxPath))
+				label := f.FileName
+				if label == "" {
+					label = fmt.Sprintf("file_%d", i+1)
+				}
+				fileContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL)))
 			}
-			fileContent.WriteString(fmt.Sprintf("\n\n[%s](%s)", label, buildAbsoluteURL(c, h.cfg, relURL)))
-		}
-		writeChunk(ChatCompletionChunk{
-			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: fileContent.String()}, FinishReason: nil}},
-		})
+			writeChunk(ChatCompletionChunk{
+				ID: chatID, Object: "chat.completion.chunk", Created: created, Model: model,
+				Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: fileContent.String()}, FinishReason: nil}},
+			})
 		}
 	}
 
@@ -397,9 +398,8 @@ func (h *ChatHandler) handleNonStream(c *gin.Context, entry *sessionEntry, opts 
 
 	result, err := h.chatWithRetry(c, entry, opts)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: ErrorDetail{Message: err.Error(), Type: "server_error"},
-		})
+		status, errResp := errorResponseFromError(err)
+		c.JSON(status, errResp)
 		return
 	}
 
@@ -497,20 +497,20 @@ func parseMessageContent(c interface{}) (text string, images []string) {
 					if txt, ok := m["text"].(string); ok {
 						text += txt
 					}
-			} else if t == "image_url" {
-				if imgUrl, ok := m["image_url"].(map[string]interface{}); ok {
-					if url, ok := imgUrl["url"].(string); ok {
-						images = append(images, url)
+				} else if t == "image_url" {
+					if imgUrl, ok := m["image_url"].(map[string]interface{}); ok {
+						if url, ok := imgUrl["url"].(string); ok {
+							images = append(images, url)
+						}
+					}
+				} else if t == "file" {
+					if filePart, ok := m["file"].(map[string]interface{}); ok {
+						if fileData, ok := filePart["file_data"].(string); ok && fileData != "" {
+							// data:application/pdf;base64,... 格式，直接复用 data URL 通道
+							images = append(images, fileData)
+						}
 					}
 				}
-			} else if t == "file" {
-				if filePart, ok := m["file"].(map[string]interface{}); ok {
-					if fileData, ok := filePart["file_data"].(string); ok && fileData != "" {
-						// data:application/pdf;base64,... 格式，直接复用 data URL 通道
-						images = append(images, fileData)
-					}
-				}
-			}
 			}
 		}
 	}
@@ -591,21 +591,21 @@ func (h *ChatHandler) HandlePDFProxy(c *gin.Context) {
 // guessFileName 根据 MIME 类型猜测一个合适的文件名
 func guessFileName(mime string) string {
 	extMap := map[string]string{
-		"image/jpeg":                                                          "upload.jpg",
-		"image/png":                                                           "upload.png",
-		"image/gif":                                                           "upload.gif",
-		"image/webp":                                                          "upload.webp",
-		"application/pdf":                                                     "document.pdf",
-		"application/msword":                                                  "document.doc",
+		"image/jpeg":         "upload.jpg",
+		"image/png":          "upload.png",
+		"image/gif":          "upload.gif",
+		"image/webp":         "upload.webp",
+		"application/pdf":    "document.pdf",
+		"application/msword": "document.doc",
 		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document.docx",
-		"application/vnd.ms-excel":                                           "spreadsheet.xls",
-		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":  "spreadsheet.xlsx",
-		"application/vnd.ms-powerpoint":                                      "presentation.ppt",
+		"application/vnd.ms-excel": "spreadsheet.xls",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         "spreadsheet.xlsx",
+		"application/vnd.ms-powerpoint":                                             "presentation.ppt",
 		"application/vnd.openxmlformats-officedocument.presentationml.presentation": "presentation.pptx",
-		"text/plain":                                                          "document.txt",
-		"text/csv":                                                            "data.csv",
-		"application/json":                                                    "data.json",
-		"text/markdown":                                                       "document.md",
+		"text/plain":       "document.txt",
+		"text/csv":         "data.csv",
+		"application/json": "data.json",
+		"text/markdown":    "document.md",
 	}
 	if name, ok := extMap[mime]; ok {
 		return name

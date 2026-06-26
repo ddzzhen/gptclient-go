@@ -18,11 +18,11 @@ import (
 type ImageAspectRatio string
 
 const (
-	ImageAspectAuto      ImageAspectRatio = ""      // 自动（默认）
-	ImageAspectSquare    ImageAspectRatio = "1:1"   // 方形
-	ImageAspectPortrait  ImageAspectRatio = "3:4"   // 竖版
-	ImageAspectStory     ImageAspectRatio = "9:16"  // 故事版
-	ImageAspectLandscape ImageAspectRatio = "4:3"   // 横版
+	ImageAspectAuto       ImageAspectRatio = ""     // 自动（默认）
+	ImageAspectSquare     ImageAspectRatio = "1:1"  // 方形
+	ImageAspectPortrait   ImageAspectRatio = "3:4"  // 竖版
+	ImageAspectStory      ImageAspectRatio = "9:16" // 故事版
+	ImageAspectLandscape  ImageAspectRatio = "4:3"  // 横版
 	ImageAspectWidescreen ImageAspectRatio = "16:9" // 宽屏
 )
 
@@ -211,7 +211,7 @@ func (c *Client) getWsURL() (string, error) {
 		return "", fmt.Errorf("celsius/ws/user request: %w", err)
 	}
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("celsius/ws/user %d: %s", resp.StatusCode, truncateStr(resp.String(), 200))
+		return "", ClassifyHTTPError("celsius/ws/user", resp.StatusCode, resp.String(), resp.Header.Get("Retry-After"))
 	}
 	var result struct {
 		WebsocketURL string `json:"websocket_url"`
@@ -297,7 +297,7 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("conversation %d: %s", resp.StatusCode, truncateStr(string(b), 500))
+		return nil, ClassifyHTTPError("conversation", resp.StatusCode, string(b), resp.Header.Get("Retry-After"))
 	}
 
 	result := &ChatResult{}
@@ -728,7 +728,10 @@ func (c *Client) subscribeWSImageCombined(conn *websocket.Conn, turnTopicID, con
 		}
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("ws read: %w", err)
+			if done, finishErr := c.tryFinishImageGenWS(result, opts, waitStart, "read_error"); done {
+				return finishErr
+			}
+			return NewUpstreamError(ErrWSDisconnected, "websocket image stream disconnected", 0, "", err)
 		}
 		readWait := readDeadlineExt
 		if result.imageGenConvAsyncStatusDone || result.imageGenAsyncCompleteSeen {
@@ -836,6 +839,7 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 	var useDeltaEncoding bool
 	var currentEvent string
 	done := false
+	reconnectAttempts := 0
 
 	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
@@ -843,7 +847,27 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 	for !done {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("ws read: %w", err)
+			if result.assistantFinalText != "" || result.bodyStreamFromSSE {
+				c.logf("[ws] read ended after final body: %v", err)
+				return nil
+			}
+			if reconnectAttempts < 2 {
+				reconnectAttempts++
+				c.logf("[ws] read failed, reconnecting attempt=%d: %v", reconnectAttempts, err)
+				_ = conn.Close()
+				newConn, dialErr := c.dialChatWS()
+				if dialErr != nil {
+					return NewUpstreamError(ErrWSDisconnected, "websocket reconnect failed", 0, "", dialErr)
+				}
+				conn = newConn
+				defer conn.Close()
+				if err := conn.WriteJSON(subMsg); err != nil {
+					return NewUpstreamError(ErrWSDisconnected, "websocket resubscribe failed", 0, "", err)
+				}
+				conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+				continue
+			}
+			return NewUpstreamError(ErrWSDisconnected, "websocket stream disconnected", 0, "", err)
 		}
 
 		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
@@ -1184,10 +1208,11 @@ func (c *Client) emitBodyFull(result *ChatResult, lastText *string, text, channe
 
 // processDeltaSSE 处理 delta 编码模式的 SSE 事件
 // ChatGPT delta 格式有多种变体：
-//  A) 顶层 patch：{"p":"/message/content/parts/0","o":"append","v":"text"}
-//  B) 简写 append：{"v":"text"}（省略 p/o，隐含对 parts/0 的追加）
-//  C) 消息对象 add：{"p":"","o":"add","v":{"message":{...}}}
-//  D) 完成 patch 数组：{"p":"","o":"patch","v":[...patches...]}
+//
+//	A) 顶层 patch：{"p":"/message/content/parts/0","o":"append","v":"text"}
+//	B) 简写 append：{"v":"text"}（省略 p/o，隐含对 parts/0 的追加）
+//	C) 消息对象 add：{"p":"","o":"add","v":{"message":{...}}}
+//	D) 完成 patch 数组：{"p":"","o":"patch","v":[...patches...]}
 func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult, lastText *string, handler StreamHandler) {
 	pPath, _ := evt["p"].(string)
 	pOp, _ := evt["o"].(string)
@@ -1388,7 +1413,6 @@ func (c *Client) processFullSSE(evt map[string]interface{}, result *ChatResult, 
 		}
 	}
 }
-
 
 // fetchTextdocs 调用 textdocs API 获取思考步骤的详细内容
 // textdocs 返回一个对象数组，每个对象包含 type、thought（含 summary/content）等字段

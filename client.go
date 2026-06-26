@@ -25,6 +25,7 @@ type Client struct {
 	buildHash   string
 	buildNumber string
 	language    string
+	csrfToken   string
 	sessionID   string
 	imageDir    string
 	startTime   time.Time
@@ -56,6 +57,7 @@ func NewClient(cfg Config) *Client {
 		buildHash:       orDefault(cfg.BuildHash, defaultBuildHash),
 		buildNumber:     orDefault(cfg.BuildNumber, defaultBuildNumber),
 		language:        orDefault(cfg.Language, defaultLang),
+		csrfToken:       cfg.CSRFToken,
 		imageDir:        orDefault(cfg.ImageDir, "images"),
 		model:           orDefault(cfg.Model, defaultModel),
 		parentMessageID: "client-created-root",
@@ -104,6 +106,18 @@ func (c *Client) SetBearerToken(token string) {
 	c.httpClient.SetCommonHeader("Authorization", "Bearer "+token)
 }
 
+// SetCSRFToken updates the optional CSRF/XSRF header used if upstream starts requiring it.
+func (c *Client) SetCSRFToken(token string) {
+	c.csrfToken = token
+	if token == "" {
+		c.httpClient.SetCommonHeader("X-CSRF-Token", "")
+		c.httpClient.SetCommonHeader("X-XSRF-Token", "")
+		return
+	}
+	c.httpClient.SetCommonHeader("X-CSRF-Token", token)
+	c.httpClient.SetCommonHeader("X-XSRF-Token", token)
+}
+
 // SetConversationID 恢复到指定对话
 func (c *Client) SetConversationID(id string) { c.conversationID = id }
 
@@ -139,21 +153,25 @@ func (c *Client) commonHeaders() map[string]string {
 		"oai-client-build-number":     c.buildNumber,
 		"Origin":                      "https://chatgpt.com",
 		"Referer":                     "https://chatgpt.com/",
-		"sec-ch-ua":                   `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`,
+		"sec-ch-ua":                   `"Chromium";v="147", "Not-A.Brand";v="24", "Microsoft Edge";v="147"`,
 		"sec-ch-ua-mobile":            "?0",
 		"sec-ch-ua-platform":          `"Windows"`,
 		"sec-ch-ua-platform-version":  `"19.0.0"`,
 		"sec-ch-ua-arch":              `"x86"`,
 		"sec-ch-ua-bitness":           `"64"`,
 		"sec-ch-ua-model":             `""`,
-		"sec-ch-ua-full-version":      `"146.0.3856.72"`,
-		"sec-ch-ua-full-version-list": `"Chromium";v="146.0.7680.154", "Not-A.Brand";v="24.0.0.0", "Microsoft Edge";v="146.0.3856.72"`,
+		"sec-ch-ua-full-version":      `"147.0.0.0"`,
+		"sec-ch-ua-full-version-list": `"Chromium";v="147.0.0.0", "Not-A.Brand";v="24.0.0.0", "Microsoft Edge";v="147.0.0.0"`,
 		"sec-fetch-dest":              "empty",
 		"sec-fetch-mode":              "cors",
 		"sec-fetch-site":              "same-origin",
 	}
 	if c.cookieStr != "" {
 		h["Cookie"] = c.cookieStr
+	}
+	if c.csrfToken != "" {
+		h["X-CSRF-Token"] = c.csrfToken
+		h["X-XSRF-Token"] = c.csrfToken
 	}
 	return h
 }
