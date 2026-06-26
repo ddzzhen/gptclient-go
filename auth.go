@@ -121,7 +121,7 @@ func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error
 	c.logf("  [sentinel] persona=%s, PoW=%v, turnstile=%v", pd.Persona, powRequired, turnstileRequired)
 
 	if turnstileRequired {
-		return "", "", NewUpstreamError(ErrSentinelTurnstileRequired, "sentinel turnstile challenge is required but no solver is configured", http.StatusForbidden, truncateStr(resp.String(), 500), nil)
+		c.logf("  [sentinel] turnstile challenge advertised; trying finalize without solver")
 	}
 
 	if powRequired {
@@ -158,7 +158,13 @@ func (c *Client) getSentinelToken() (sentinelToken, proofToken string, err error
 	}
 	if finResp.StatusCode != 200 {
 		ue := ClassifyHTTPError("sentinel/finalize", finResp.StatusCode, finResp.String(), finResp.Header.Get("Retry-After"))
-		ue.Code = ErrSentinelFinalizeFailed
+		if turnstileRequired && finResp.StatusCode == http.StatusForbidden {
+			ue.Code = ErrSentinelTurnstileRequired
+			ue.Message = "sentinel turnstile challenge is required and finalize was rejected"
+			ue.Retryable = false
+		} else {
+			ue.Code = ErrSentinelFinalizeFailed
+		}
 		return "", "", ue
 	}
 
