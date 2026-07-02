@@ -16,17 +16,22 @@ type TokenPool struct {
 	roundIdx     int
 	tokensFile   string
 	refreshAhead time.Duration
+	notifier     Notifier
 }
 
 // NewTokenPool 创建并从 JSON 文件加载 Token 池（兼容旧版行格式）。
-func NewTokenPool(tokensFile string, refreshAhead time.Duration) *TokenPool {
+func NewTokenPool(tokensFile string, refreshAhead time.Duration, notifier Notifier) *TokenPool {
 	if refreshAhead <= 0 {
 		refreshAhead = 5 * time.Minute
+	}
+	if notifier == nil {
+		notifier = noopNotifier{}
 	}
 	tp := &TokenPool{
 		errorKeys:    make(map[string]bool),
 		tokensFile:   tokensFile,
 		refreshAhead: refreshAhead,
+		notifier:     notifier,
 	}
 	tp.loadFromFile()
 	return tp
@@ -78,6 +83,7 @@ func (tp *TokenPool) refreshEntry(e *storedToken) (string, error) {
 	}
 	at, exp, err := RefreshATFromSession(e.SessionToken)
 	if err != nil {
+		tp.notifier.NotifyTokenRefreshFailure(e.ID, err)
 		return "", err
 	}
 	e.AccessToken = at

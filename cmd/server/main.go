@@ -24,10 +24,16 @@ func main() {
 	} else {
 		log.Printf("  Authorization  : not set (direct token mode)")
 	}
+	if cfg.TelegramBotToken != "" && cfg.TelegramChatID != "" {
+		log.Printf("  Telegram Alert : configured")
+	} else {
+		log.Printf("  Telegram Alert : disabled")
+	}
 	log.Printf("============================================")
 
 	// 2. 初始化 Token 池
-	pool := server.NewTokenPool(cfg.TokensFile, time.Duration(cfg.TokenRefreshAheadSec)*time.Second)
+	notifier := server.NewTelegramNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
+	pool := server.NewTokenPool(cfg.TokensFile, time.Duration(cfg.TokenRefreshAheadSec)*time.Second, notifier)
 	total, valid, _ := pool.Stats()
 	log.Printf("[startup] Token pool: total=%d, valid=%d", total, valid)
 

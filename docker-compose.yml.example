@@ -16,6 +16,9 @@ services:
       TEMP_MODE: "false"
       # Session 超时（分钟）
       SESSION_TTL_MINUTES: "120"
+      # Telegram Bot 通知（Session Token 刷新失败时提醒）
+      TELEGRAM_BOT_TOKEN: ""
+      TELEGRAM_CHAT_ID: ""
     volumes:
       # 持久化 tokens 和图片
       - ./tokens.json:/app/tokens.json

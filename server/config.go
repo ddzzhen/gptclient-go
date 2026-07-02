@@ -32,20 +32,26 @@ type ServerConfig struct {
 
 	// Session Token 自动刷新：在 AT 过期前多少秒提前用 ST 换 AT，默认 300
 	TokenRefreshAheadSec int
+
+	// Telegram 通知：Session Token 刷新失败时提醒人工更新
+	TelegramBotToken string
+	TelegramChatID   string
 }
 
 // LoadConfig 从环境变量加载配置
 func LoadConfig() ServerConfig {
 	return ServerConfig{
-		Port:              getEnv("PORT", "5005"),
-		Authorization:     getEnv("AUTHORIZATION", ""),
-		DefaultModel:      getEnv("DEFAULT_MODEL", "gpt-5-5-thinking"),
-		TempMode:          getEnvBool("TEMP_MODE", false),
-		ImageDir:          getEnv("IMAGE_DIR", "images"),
-		TokensFile:        getEnv("TOKENS_FILE", "tokens.json"),
-		SessionTTLMinutes: getEnvInt("SESSION_TTL_MINUTES", 120),
+		Port:                 getEnv("PORT", "5005"),
+		Authorization:        getEnv("AUTHORIZATION", ""),
+		DefaultModel:         getEnv("DEFAULT_MODEL", "gpt-5-5-thinking"),
+		TempMode:             getEnvBool("TEMP_MODE", false),
+		ImageDir:             getEnv("IMAGE_DIR", "images"),
+		TokensFile:           getEnv("TOKENS_FILE", "tokens.json"),
+		SessionTTLMinutes:    getEnvInt("SESSION_TTL_MINUTES", 120),
 		BaseURL:              getEnv("BASE_URL", ""),
 		TokenRefreshAheadSec: getEnvInt("TOKEN_REFRESH_AHEAD_SEC", 300),
+		TelegramBotToken:     getEnv("TELEGRAM_BOT_TOKEN", ""),
+		TelegramChatID:       getEnv("TELEGRAM_CHAT_ID", ""),
 	}
 }
 
