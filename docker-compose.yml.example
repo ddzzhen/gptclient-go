@@ -4,10 +4,10 @@ services:
     container_name: sentinel-go
     restart: unless-stopped
     ports:
-      - "5005:5005"
+      - "5006:5005"
     environment:
       # 服务端口
-      PORT: "5005"
+      PORT: "5006"
       # 调用 API 时的授权码（留空则直接用传入的 Bearer token 作为 ChatGPT token）
       AUTHORIZATION: ""
       # 默认模型
@@ -24,7 +24,13 @@ services:
       - ./tokens.json:/app/tokens.json
       - ./images:/app/images
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5005/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:5006/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+    networks:
+      - proxy-net
+networks:
+  proxy-net:
+    external: true
