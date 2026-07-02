@@ -3,7 +3,7 @@ config.json
 tokens.txt
 tokens.json
 testdata/stream-captures/
-
+docker-compose.yml
 # DALL-E 图片下载目录
 images/
 
