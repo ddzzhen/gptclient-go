@@ -390,8 +390,8 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 	}
 
 	c.MergeApplyAndEmitArtifacts(result, opts)
-	// 仅当 final 通道正文已完整时才跳过 WS catchup（避免未出 JSON 就 handoff）
-	result.bodyStreamFromSSE = result.assistantFinalText != ""
+	// 即使 HTTP SSE 已出现 final 文本，也继续消费 WS catchup。
+	result.bodyStreamFromSSE = false
 
 	if handoffTopicID != "" && wsConn != nil {
 		c.logf("[handoff] 订阅 WebSocket topic: %s", handoffTopicID)
@@ -895,19 +895,10 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 					done = true
 				} else {
 					c.logf("[ws] reply catchups=%d", len(catchups))
-					for _, cu := range catchups {
-						if msg, ok := cu.(map[string]interface{}); ok {
-							d := c.processWSMessage(msg, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
-							if d {
-								done = true
-							}
-						}
-					}
-					// catchup 含完整流但无 [DONE] 标记时，正文已到齐即可结束
-					if !done && result.assistantFinalText != "" {
-						c.logf("[ws] catchups done, final len=%d", len([]rune(result.assistantFinalText)))
+					if c.processWSCatchups(catchups, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent) {
 						done = true
 					}
+					// 不因 assistantFinalText 非空立即结束；等待 [DONE] 或读超时，避免 multipart final 被截断。
 				}
 				continue
 			}
@@ -920,8 +911,6 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 				d := c.processWSMessage(frame, result, opts, lastText, handler, &useDeltaEncoding, &currentEvent)
 				if d {
 					done = true
-				} else if result.assistantFinalText != "" {
-					done = true
 				}
 			}
 		}
@@ -932,6 +921,79 @@ func (c *Client) subscribeWSStream(conn *websocket.Conn, topicID string, result 
 
 // subscribeWSConvUpdate 监听 WebSocket 的 conversation-update 消息（生图场景，无 turn topic 时）
 // 通过定期 Ping 心跳保活连接，最长等待 10 分钟。
+func (c *Client) processWSCatchups(catchups []interface{}, result *ChatResult, opts ChatOptions, lastText *string, handler StreamHandler, useDeltaEncoding *bool, currentEvent *string) bool {
+	if len(catchups) == 0 {
+		return false
+	}
+
+	if result.emittedBodyLen == 0 || result.ExpectGeneratedImages {
+		done := false
+		for _, cu := range catchups {
+			if msg, ok := cu.(map[string]interface{}); ok {
+				if c.processWSMessage(msg, result, opts, lastText, handler, useDeltaEncoding, currentEvent) {
+					done = true
+				}
+			}
+		}
+		return done
+	}
+
+	emittedText := *lastText
+	if emittedText == "" {
+		emittedText = result.assistantFinalText
+	}
+	prevEmittedBodyLen := result.emittedBodyLen
+	prevAssistantFinalText := result.assistantFinalText
+	replayLastText := ""
+	replayUseDeltaEncoding := *useDeltaEncoding
+	replayCurrentEvent := *currentEvent
+	done := false
+
+	c.logf("[ws] replay catchups without direct emit; emitted=%d", len([]rune(emittedText)))
+	result.emittedBodyLen = 0
+	for _, cu := range catchups {
+		if msg, ok := cu.(map[string]interface{}); ok {
+			if c.processWSMessage(msg, result, opts, &replayLastText, nil, &replayUseDeltaEncoding, &replayCurrentEvent) {
+				done = true
+			}
+		}
+	}
+
+	replayText := replayLastText
+	if result.assistantFinalText != "" && result.assistantFinalText != prevAssistantFinalText {
+		replayText = result.assistantFinalText
+	} else if replayText == "" {
+		replayText = result.assistantFinalText
+	}
+	result.emittedBodyLen = prevEmittedBodyLen
+
+	if replayText == "" {
+		result.assistantFinalText = prevAssistantFinalText
+		return done
+	}
+	if emittedText == "" {
+		c.emitBodyFull(result, lastText, replayText, "final", handler)
+		return done
+	}
+	if strings.HasPrefix(replayText, emittedText) {
+		suffix := strings.TrimPrefix(replayText, emittedText)
+		if suffix == "" || strings.HasPrefix(emittedText, suffix) {
+			result.assistantFinalText = prevAssistantFinalText
+			return done
+		}
+		c.emitBodyFull(result, lastText, replayText, "final", handler)
+		return done
+	}
+	if strings.HasPrefix(emittedText, replayText) {
+		result.assistantFinalText = prevAssistantFinalText
+		return done
+	}
+
+	c.logf("[ws] catchup text diverged from emitted body; skip direct emit emitted=%d replay=%d", len([]rune(emittedText)), len([]rune(replayText)))
+	result.assistantFinalText = prevAssistantFinalText
+	return done
+}
+
 func (c *Client) subscribeWSConvUpdate(conn *websocket.Conn, conversationID string, result *ChatResult, opts ChatOptions, handler StreamHandler) error {
 	const totalTimeout = 10 * time.Minute
 	const pingInterval = 25 * time.Second
@@ -1206,6 +1268,29 @@ func (c *Client) emitBodyFull(result *ChatResult, lastText *string, text, channe
 	}
 }
 
+func isMessageContentPartPath(path string) bool {
+	if path == "/message/content/parts" {
+		return true
+	}
+	prefix := "/message/content/parts/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r == '/' {
+			return true
+		}
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // processDeltaSSE 处理 delta 编码模式的 SSE 事件
 // ChatGPT delta 格式有多种变体：
 //
@@ -1222,7 +1307,7 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 		if result.ExpectGeneratedImages && (pPath == "/message/content/text" || strings.HasPrefix(pPath, "/message/content/text")) {
 			return
 		}
-		if pPath == "/message/content/parts/0" {
+		if isMessageContentPartPath(pPath) {
 			if text, ok := evt["v"].(string); ok && text != "" {
 				if result.isAnalysisStream() {
 					c.emitThinkingDelta(result, text, handler)
@@ -1325,7 +1410,7 @@ func (c *Client) processDeltaSSE(evt map[string]interface{}, result *ChatResult,
 				if result.ExpectGeneratedImages && po == "append" && (pp == "/message/content/text" || strings.HasPrefix(pp, "/message/content/text")) {
 					continue
 				}
-				if pp == "/message/content/parts/0" && po == "append" {
+				if isMessageContentPartPath(pp) && po == "append" {
 					if text, ok := patch["v"].(string); ok && text != "" {
 						if result.isAnalysisStream() {
 							c.emitThinkingDelta(result, text, handler)

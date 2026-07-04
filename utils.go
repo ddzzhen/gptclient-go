@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -20,8 +21,6 @@ func GenerateUUID() string {
 func perfNowMs(start time.Time) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
 }
-
-
 
 func truncateStr(s string, maxLen int) string {
 	if len(s) <= maxLen {
@@ -62,18 +61,46 @@ func getNestedString(m map[string]interface{}, keys ...string) string {
 	return ""
 }
 
-// getFirstStringPart 从 message 的 content.parts[0] 取字符串
-func getFirstStringPart(msg map[string]interface{}) string {
+// getMessageText 从 message.content 中提取完整文本。
+// 新版 ChatGPT / thinking 模型可能把 final 正文拆到多个 parts，不能只取 parts[0]。
+func getMessageText(msg map[string]interface{}) string {
 	content, ok := msg["content"].(map[string]interface{})
 	if !ok {
 		return ""
 	}
-	parts, ok := content["parts"].([]interface{})
-	if !ok || len(parts) == 0 {
-		return ""
+	return extractContentText(content)
+}
+
+// getFirstStringPart 保留旧函数名兼容调用点，实际返回完整文本。
+func getFirstStringPart(msg map[string]interface{}) string {
+	return getMessageText(msg)
+}
+
+func extractContentText(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var b strings.Builder
+		for _, item := range v {
+			b.WriteString(extractContentText(item))
+		}
+		return b.String()
+	case map[string]interface{}:
+		if text, ok := v["text"].(string); ok {
+			return text
+		}
+		if content, ok := v["content"].(string); ok {
+			return content
+		}
+		if parts, ok := v["parts"].([]interface{}); ok {
+			return extractContentText(parts)
+		}
+		if content, ok := v["content"].(map[string]interface{}); ok {
+			return extractContentText(content)
+		}
 	}
-	s, _ := parts[0].(string)
-	return s
+	return ""
 }
 
 var fileIDRegexp = regexp.MustCompile(`file_[a-f0-9]+`)
