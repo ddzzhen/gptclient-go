@@ -8,6 +8,7 @@ import (
 // ServerConfig 服务器配置，全部从环境变量读取
 type ServerConfig struct {
 	// HTTP 服务
+	Host string // 监听地址，默认 0.0.0.0
 	Port string // 监听端口，默认 5005
 
 	// 鉴权：调用本服务的 API Key（区别于 ChatGPT Bearer Token）
@@ -41,6 +42,7 @@ type ServerConfig struct {
 // LoadConfig 从环境变量加载配置
 func LoadConfig() ServerConfig {
 	return ServerConfig{
+		Host:                 getEnv("HOST", "0.0.0.0"),
 		Port:                 getEnv("PORT", "5005"),
 		Authorization:        getEnv("AUTHORIZATION", ""),
 		DefaultModel:         getEnv("DEFAULT_MODEL", "gpt-5-5-thinking"),

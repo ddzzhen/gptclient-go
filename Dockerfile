@@ -32,6 +32,7 @@ COPY --from=builder /build/sentinel-server .
 RUN mkdir -p /app/images
 
 # 默认环境变量
+ENV HOST=0.0.0.0
 ENV PORT=5005
 ENV DEFAULT_MODEL=gpt-5-5-thinking
 ENV TEMP_MODE=false

@@ -14,7 +14,7 @@ func main() {
 
 	log.Printf("============================================")
 	log.Printf("  sentinel-go API Server")
-	log.Printf("  Port           : %s", cfg.Port)
+	log.Printf("  Listen Address : %s:%s", cfg.Host, cfg.Port)
 	log.Printf("  Default Model  : %s", cfg.DefaultModel)
 	log.Printf("  Temp Mode      : %v", cfg.TempMode)
 	log.Printf("  Tokens File    : %s", cfg.TokensFile)
@@ -45,9 +45,9 @@ func main() {
 	r := server.NewRouter(&cfg, pool, session)
 
 	// 5. 启动服务
-	addr := fmt.Sprintf(":%s", cfg.Port)
-	log.Printf("[startup] Listening on http://0.0.0.0%s", addr)
-	log.Printf("[startup] API endpoint: http://0.0.0.0%s/v1/chat/completions", addr)
+	addr := fmt.Sprintf("%s:%s", cfg.Host, cfg.Port)
+	log.Printf("[startup] Listening on http://%s", addr)
+	log.Printf("[startup] API endpoint: http://%s/v1/chat/completions", addr)
 
 	if err := r.Run(addr); err != nil {
 		log.Fatalf("Server error: %v", err)
