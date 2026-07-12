@@ -24,6 +24,8 @@ type ThinkStep struct {
 // ChatResult 单轮对话结果
 type ChatResult struct {
 	Text                        string            // 助手回复的完整文本
+	RequestedModel              string            // 本地提交给 chatgpt.com 的模型 slug
+	UpstreamModel               string            // chatgpt.com 实际路由使用的模型 slug
 	ThinkingText                string            // 思考过程文本（analysis channel，用于追踪增量）
 	ThinkSteps                  []ThinkStep       // 思考步骤列表（含 summary + content 详细内容）
 	deltaChannel                string            // 内部：当前 delta 消息的 channel（analysis / final / ""）

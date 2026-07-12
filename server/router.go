@@ -41,15 +41,16 @@ func NewRouter(cfg *ServerConfig, pool *TokenPool, session *SessionManager) *gin
 	r.GET("/tokens/errors", tokens.HandleErrors)
 
 	chat := NewChatHandler(cfg, pool, session)
+	models := NewModelsHandler(cfg)
 
 	// ─── 需鉴权接口（OpenAI API）────────────────────────────────────────────────
 	apiAuth := r.Group("/")
 	apiAuth.Use(AuthMiddleware(cfg, pool))
 	{
 		apiAuth.POST("/v1/chat/completions", chat.Handle)
-		apiAuth.GET("/v1/models", HandleModels)
+		apiAuth.GET("/v1/models", models.Handle)
 		apiAuth.POST("/chat/completions", chat.Handle)
-		apiAuth.GET("/models", HandleModels)
+		apiAuth.GET("/models", models.Handle)
 	}
 
 	// ─── 管理前端与静态资源 ────────────────────────────────────────────────────────

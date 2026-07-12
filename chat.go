@@ -167,6 +167,13 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 	if err != nil {
 		return nil, err
 	}
+	if result.UpstreamModel == "" {
+		c.logf("[model-route] requested_model=%s upstream_model=unknown", c.model)
+	} else if result.UpstreamModel != c.model {
+		c.logf("[model-route] fallback requested_model=%s upstream_model=%s", c.model, result.UpstreamModel)
+	} else {
+		c.logf("[model-route] requested_model=%s upstream_model=%s", c.model, result.UpstreamModel)
+	}
 
 	if result.ConversationID != "" {
 		c.conversationID = result.ConversationID
@@ -300,7 +307,7 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 		return nil, ClassifyHTTPError("conversation", resp.StatusCode, string(b), resp.Header.Get("Retry-After"))
 	}
 
-	result := &ChatResult{}
+	result := &ChatResult{RequestedModel: c.model}
 	var lastText string
 	var useDeltaEncoding bool
 	var currentEvent string
@@ -358,6 +365,7 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 			currentEvent = ""
 			continue
 		case "server_ste_metadata":
+			c.noteUpstreamModel(result, evt)
 			if handoffTopicID == "" {
 				if md, ok := evt["metadata"].(map[string]interface{}); ok {
 					if tid, ok := md["turn_exchange_id"].(string); ok && tid != "" {
@@ -370,12 +378,15 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 		}
 
 		// 兼容 event: server_ste_metadata + data 内无 type 字段的旧格式
-		if currentEvent == "server_ste_metadata" && handoffTopicID == "" {
-			if tid, ok := evt["turn_exchange_id"].(string); ok && tid != "" {
-				handoffTopicID = "conversation-turn-" + tid
-			} else if md, ok := evt["metadata"].(map[string]interface{}); ok {
-				if tid, ok := md["turn_exchange_id"].(string); ok && tid != "" {
+		if currentEvent == "server_ste_metadata" {
+			c.noteUpstreamModel(result, evt)
+			if handoffTopicID == "" {
+				if tid, ok := evt["turn_exchange_id"].(string); ok && tid != "" {
 					handoffTopicID = "conversation-turn-" + tid
+				} else if md, ok := evt["metadata"].(map[string]interface{}); ok {
+					if tid, ok := md["turn_exchange_id"].(string); ok && tid != "" {
+						handoffTopicID = "conversation-turn-" + tid
+					}
 				}
 			}
 		}
@@ -428,6 +439,17 @@ func (c *Client) streamConversation(body interface{}, opts ChatOptions, sentinel
 		result.Text = lastText
 	}
 	return result, nil
+}
+
+func (c *Client) noteUpstreamModel(result *ChatResult, evt map[string]interface{}) {
+	if result == nil || result.UpstreamModel != "" || evt == nil {
+		return
+	}
+	if md, ok := evt["metadata"].(map[string]interface{}); ok {
+		if slug, ok := md["model_slug"].(string); ok && slug != "" {
+			result.UpstreamModel = slug
+		}
+	}
 }
 
 func (c *Client) noteConversationID(result *ChatResult, opts ChatOptions, evt map[string]interface{}) {

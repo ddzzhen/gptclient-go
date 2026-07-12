@@ -12,8 +12,9 @@ RUN go mod download
 
 # 复制源码并构建
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w" -o /build/sentinel-server ./cmd/server/
+# 限制并行编译，降低 1GB 等小内存 VPS 上的峰值内存占用。
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOMAXPROCS=1 \
+    go build -p=1 -ldflags="-s -w" -o /build/sentinel-server ./cmd/server/
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM alpine:3.20
