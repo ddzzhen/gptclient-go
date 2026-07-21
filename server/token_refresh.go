@@ -1,44 +1,65 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/imroc/req/v3"
 )
 
-const sessionAuthURL = "https://chatgpt.com/api/auth/session"
+const (
+	sessionAuthURL             = "https://chatgpt.com/api/auth/session"
+	tlsFingerprintChromeVersion = "131"
+)
 
-var sessionHTTPClient = &http.Client{Timeout: 30 * time.Second}
+var defaultRefreshUA = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36", tlsFingerprintChromeVersion)
 
-// RefreshATFromSession 用 Session Token 换取新的 Access Token（Web 作用域）。
 func RefreshATFromSession(sessionToken string) (accessToken string, expiresAt time.Time, err error) {
 	sessionToken = normalizeSessionToken(sessionToken)
 	if sessionToken == "" {
 		return "", time.Time{}, errors.New("session token is empty")
 	}
 
-	req, err := http.NewRequest(http.MethodGet, sessionAuthURL, nil)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Referer", "https://chatgpt.com/")
-	req.Header.Set("Origin", "https://chatgpt.com")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.AddCookie(&http.Cookie{Name: "__Secure-next-auth.session-token", Value: sessionToken})
+	c := req.C().
+		SetBaseURL("https://chatgpt.com").
+		ImpersonateChrome()
 
-	resp, err := sessionHTTPClient.Do(req)
+	cookieVal := "__Secure-next-auth.session-token=" + sessionToken
+
+	resp, err := c.R().
+		SetHeaders(map[string]string{
+			"Accept":                "application/json",
+			"Referer":              "https://chatgpt.com/",
+			"Origin":               "https://chatgpt.com",
+			"User-Agent":           defaultRefreshUA,
+			"Accept-Language":      "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+			"Accept-Encoding":      "gzip, deflate, br, zstd",
+			"Cookie":               cookieVal,
+			"sec-ch-ua":            fmt.Sprintf(`"Chromium";v="%s", "Not-A.Brand";v="24", "Google Chrome";v="%s"`, tlsFingerprintChromeVersion, tlsFingerprintChromeVersion),
+			"sec-ch-ua-mobile":     "?0",
+			"sec-ch-ua-platform":   `"Windows"`,
+			"sec-ch-ua-platform-version": `"19.0.0"`,
+			"sec-ch-ua-arch":              `"x86"`,
+			"sec-ch-ua-bitness":           `"64"`,
+			"sec-ch-ua-model":             `""`,
+			"sec-ch-ua-full-version":      fmt.Sprintf(`"%s.0.0.0"`, tlsFingerprintChromeVersion),
+			"sec-ch-ua-full-version-list": fmt.Sprintf(`"Chromium";v="%s.0.0.0", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="%s.0.0.0"`, tlsFingerprintChromeVersion, tlsFingerprintChromeVersion),
+			"sec-fetch-dest":              "empty",
+			"sec-fetch-mode":              "cors",
+			"sec-fetch-site":              "same-origin",
+		}).
+		Get("/api/auth/session")
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("session refresh request: %w", err)
 	}
-	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
+	data := resp.Bytes()
 	if resp.StatusCode != http.StatusOK {
 		return "", time.Time{}, fmt.Errorf("session refresh http=%d body=%s", resp.StatusCode, truncateBody(string(data), 200))
 	}
@@ -71,7 +92,15 @@ func RefreshATFromSession(sessionToken string) (accessToken string, expiresAt ti
 	return out.AccessToken, expiresAt, nil
 }
 
-// normalizeSessionToken 去掉常见前缀，得到裸 Session Token。
+func RefreshATFromBrowser(ctx context.Context, bm interface {
+	RefreshAccessToken(ctx context.Context) (string, time.Time, error)
+}, sessionToken string) (accessToken string, expiresAt time.Time, err error) {
+	if bm == nil {
+		return RefreshATFromSession(sessionToken)
+	}
+	return bm.RefreshAccessToken(ctx)
+}
+
 func normalizeSessionToken(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "st:")
@@ -87,7 +116,6 @@ func normalizeSessionToken(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// parseJWTExp 从 JWT payload 解析 exp；失败则默认 +24h。
 func parseJWTExp(token string) time.Time {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
@@ -113,7 +141,6 @@ func isAccessToken(s string) bool {
 	if !strings.HasPrefix(s, "eyJ") || strings.Count(s, ".") < 2 {
 		return false
 	}
-	// JWE Session Token（alg=dir）不是 Access Token
 	if strings.HasPrefix(s, "eyJhbGciOiJkaXIi") {
 		return false
 	}

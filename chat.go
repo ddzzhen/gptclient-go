@@ -48,18 +48,22 @@ func (c *Client) Chat(opts ChatOptions) (*ChatResult, error) {
 func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResult, error) {
 	turnTraceID := GenerateUUID()
 
+	c.jitterSleep()
+
 	c.logf("[step 1] 获取 conduit token...")
 	conduitToken, err := c.getConduitToken(c.model, turnTraceID, runeSlice(opts.Text, 5))
 	if err != nil {
 		return nil, fmt.Errorf("get conduit token: %w", err)
 	}
 
+	c.jitterSleep()
 	c.logf("[step 2] 获取 sentinel token...")
 	sentinelToken, proofToken, err := c.getSentinelToken()
 	if err != nil {
 		return nil, fmt.Errorf("get sentinel token: %w", err)
 	}
 
+	c.jitterSleep()
 	c.logf("[step 2.5] 建立 WebSocket 连接...")
 	wsConn, err := c.dialChatWS()
 	if err != nil {
@@ -141,11 +145,11 @@ func (c *Client) ChatStream(opts ChatOptions, handler StreamHandler) (*ChatResul
 		"client_contextual_info": map[string]interface{}{
 			"is_dark_mode":      false,
 			"time_since_loaded": int(math.Round(perfNowMs(c.startTime) / 1000.0)),
-			"page_height":       1014,
-			"page_width":        1055,
-			"pixel_ratio":       1,
-			"screen_height":     1080,
-			"screen_width":      1920,
+			"page_height":       c.pageHeight,
+			"page_width":        c.pageWidth,
+			"pixel_ratio":       c.pixelRatio,
+			"screen_height":     c.screenHeight,
+			"screen_width":      c.screenWidth,
 			"app_name":          "chatgpt.com",
 		},
 		"history_and_training_disabled":        c.tempMode,
@@ -1535,13 +1539,13 @@ func (c *Client) fetchTextdocs(conversationID string) ([]ThinkStep, error) {
 		return nil, fmt.Errorf("textdocs 请求失败: %w", err)
 	}
 	if resp.IsErrorState() {
-		return nil, fmt.Errorf("textdocs 返回错误: status=%d body=%s", resp.StatusCode, resp.String()[:min(200, len(resp.String()))])
+		return nil, fmt.Errorf("textdocs 返回错误: status=%d body=%s", resp.StatusCode, resp.String()[:minInt(200, len(resp.String()))])
 	}
 
 	// textdocs 返回格式：{"textdocs": [{"type": 0, "thought": {"summary": "...", "content": "...", ...}}, ...]}
 	// 或直接是数组
 	rawBody := resp.String()
-	c.logf("[textdocs] 原始响应 status=%d len=%d snippet=%s", resp.StatusCode, len(rawBody), rawBody[:min(500, len(rawBody))])
+	c.logf("[textdocs] 原始响应 status=%d len=%d snippet=%s", resp.StatusCode, len(rawBody), rawBody[:minInt(500, len(rawBody))])
 
 	var rawData interface{}
 	if err := json.Unmarshal(resp.Bytes(), &rawData); err != nil {
@@ -1640,7 +1644,7 @@ func mapKeys(m map[string]interface{}) []string {
 	return keys
 }
 
-func min(a, b int) int {
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}

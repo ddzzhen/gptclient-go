@@ -186,10 +186,8 @@ func (c *Client) ProxyPDFBySandboxPath(conversationID, messageID, sandboxPath st
 
 	}
 
-	resp, err := req.C().R().
-
+	resp, err := req.C().ImpersonateChrome().R().
 		SetHeader("User-Agent", ua).
-
 		Get(downloadURL)
 
 	if err != nil {
@@ -238,7 +236,7 @@ func (c *Client) DownloadSandboxFile(conversationID, messageID, sandboxPath stri
 	if ua == "" {
 		ua = "Mozilla/5.0"
 	}
-	resp, err := req.C().R().SetHeader("User-Agent", ua).Get(downloadURL)
+	resp, err := req.C().ImpersonateChrome().R().SetHeader("User-Agent", ua).Get(downloadURL)
 	if err != nil {
 		return nil, "", err
 	}

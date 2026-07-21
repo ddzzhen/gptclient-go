@@ -6,23 +6,36 @@ services:
     ports:
       - "5006:5005"
     environment:
-      # 容器内服务端口（宿主机通过 5006 映射访问）
       PORT: "5005"
-      # 调用 API 时的授权码（留空则直接用传入的 Bearer token 作为 ChatGPT token）
       AUTHORIZATION: ""
-      # 默认模型
       DEFAULT_MODEL: "gpt-5-5-thinking"
-      # 临时模式（不保存历史）
       TEMP_MODE: "false"
-      # Session 超时（分钟）
       SESSION_TTL_MINUTES: "120"
-      # Telegram Bot 通知（Session Token 刷新失败时提醒）
       TELEGRAM_BOT_TOKEN: ""
       TELEGRAM_CHAT_ID: ""
+      # Browser mode: uses real Chromium for auth + Turnstile
+      BROWSER_ENABLED: "true"
+      BROWSER_HEADLESS: "true"
+      # Optional: custom Chrome path (default: auto-detect)
+      # BROWSER_CHROME_PATH: "/usr/bin/chromium-browser"
+      # Optional: persistent browser profile directory
+      # BROWSER_USER_DATA_DIR: "/app/browser-data"
+      # Optional: connect to existing Chrome via DevTools Protocol
+      # BROWSER_REMOTE_URL: "ws://host.docker.internal:9222"
+      BROWSER_TIMEOUT_SEC: "60"
+      # Route all API requests through browser (most stealthy, higher latency)
+      USE_BROWSER_PROXY: "false"
+      DATA_DIR: "/app/data"
     volumes:
-      # 持久化 tokens 和图片
       - ./tokens.json:/app/tokens.json
       - ./images:/app/images
+      - ./data:/app/data
+      # Optional: persist browser profile for faster re-auth
+      # - ./browser-data:/app/browser-data
+    # Required for Chromium sandbox in Docker
+    security_opt:
+      - seccomp:unconfined
+    shm_size: '2gb'
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:5005/health"]
       interval: 30s

@@ -1,17 +1,3 @@
-// Package chatgpt — POW 算法迁移自 gen_image.py
-//
-// chatgpt.com sentinel 使用两种 POW token:
-//
-//  1. RequirementsToken  → 客户端主动生成,塞进 /sentinel/chat-requirements
-//     请求体的 `p` 字段。前缀 "gAAAAAC"。固定难度 "0fffff"。
-//     config 是 18 元素数组,迭代 config[3] 与 config[9]。
-//
-//  2. ProofToken         → 服务端返回 `proofofwork.required=true` + seed + difficulty,
-//     客户端本地求解后放进 Header `openai-sentinel-proof-token`。
-//     前缀 "gAAAAAB"。config 是 13 元素数组,只迭代 config[3]。
-//
-// 两者共享同一个判定函数:SHA3-512(seed + base64(config_json)) 的前 N 字节
-// 按字节序 <= bytes.fromhex(difficulty)。若不满足则 config[3] += 1 重试。
 package sentinel
 
 import (
@@ -30,16 +16,6 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-// TurnstileSolver 负责把 /sentinel/chat-requirements/prepare 返回的 `turnstile.dx`
-// 挑战字符串,解算成 /sentinel/chat-requirements/finalize 需要的 turnstile
-// response 字符串。
-//
-// 说明:OpenAI 的 turnstile 是基于 Cloudflare turnstile 衍生的自定义 challenge,
-// dx 是混淆 JS + WebAssembly 的输入,response 是执行结果。纯 Go 无法还原,
-// 解算必须委托给外部服务(2captcha/capsolver/自建 headless 浏览器等)。
-//
-// 没有 solver 时,Client.ChatRequirementsV2 会自动回退到老的单步
-// chat-requirements 流程(Turnstile=true 直接忽略)。
 type TurnstileSolver interface {
 	Solve(ctx context.Context, dx string) (string, error)
 }
@@ -57,72 +33,99 @@ const (
 )
 
 var (
-	powCores   = []int{16, 24, 32}
-	powScreens = []int{3000, 4000, 6000}
+	powCores   = []int{2, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64}
+	powScreens = []int{1366, 1440, 1536, 1600, 1680, 1920, 2560, 3840}
 
 	powNavKeys = []string{
-		"webdriver−false", "vendor−Google Inc.", "cookieEnabled−true",
-		"pdfViewerEnabled−true", "hardwareConcurrency−32",
-		"language−zh-CN", "mimeTypes−[object MimeTypeArray]",
-		"userAgentData−[object NavigatorUAData]",
+		"webdriver-false", "vendor-Google Inc.", "cookieEnabled-true",
+		"pdfViewerEnabled-true", "hardwareConcurrency-8",
+		"language-zh-CN", "mimeTypes-[object MimeTypeArray]",
+		"userAgentData-[object NavigatorUAData]",
+		"webdriver-false", "vendor-Google Inc.", "cookieEnabled-true",
+		"pdfViewerEnabled-true", "hardwareConcurrency-12",
+		"language-en-US", "mimeTypes-[object MimeTypeArray]",
+		"userAgentData-[object NavigatorUAData]",
+		"webdriver-false", "vendor-Google Inc.", "cookieEnabled-true",
+		"pdfViewerEnabled-true", "hardwareConcurrency-16",
+		"language-zh-CN", "mimeTypes-[object MimeTypeArray]",
+		"userAgentData-[object NavigatorUAData]",
+		"webdriver-false", "vendor-Google Inc.", "cookieEnabled-true",
+		"pdfViewerEnabled-true", "hardwareConcurrency-4",
+		"language-en-US", "mimeTypes-[object MimeTypeArray]",
+		"userAgentData-[object NavigatorUAData]",
 	}
 	powWinKeys = []string{
 		"innerWidth", "innerHeight", "devicePixelRatio", "screen",
 		"chrome", "location", "history", "navigator",
+		"outerWidth", "outerHeight", "screenX", "screenY",
+		"pageXOffset", "pageYOffset", "visualViewport",
 	}
 
-	powReactListeners = []string{"_reactListeningcfilawjnerp", "_reactListening9ne2dfo1i47"}
-	powProofEvents    = []string{"alert", "ontransitionend", "onprogress"}
+	powReactListeners = []string{
+		"_reactListeningcfilawjnerp", "_reactListening9ne2dfo1i47",
+		"_reactListening8xk3mnp2oq1", "_reactListening5ty7uvw9rs0",
+		"_reactListening2ab4cde6fg3", "_reactListening1hi5jkl7mn9",
+	}
+	powProofEvents = []string{
+		"alert", "ontransitionend", "onprogress",
+		"onanimationend", "onload", "onerror",
+		"onfocus", "onblur", "onresize",
+	}
 
-	// perfCounter 模拟浏览器 performance.counter() 的单调递增(亚秒级)。
 	perfCounter uint64
 )
 
-// POWConfig 是 18 元素的客户端指纹数组(requirements_token 用)。
 type POWConfig struct {
 	userAgent string
 	arr       [18]interface{}
 }
 
-// NewPOWConfig 构造一个随机化的客户端指纹,用于 requirements + proof 两种场景。
 func NewPOWConfig(userAgent string) *POWConfig {
 	if userAgent == "" {
 		userAgent = defaultUA
 	}
-	//nolint:gosec // 非加密用途
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	now := time.Now().UTC()
 	timeStr := now.Format("Mon Jan 02 2006 15:04:05") + " GMT+0000 (UTC)"
 	perf := float64(atomic.AddUint64(&perfCounter, 1)) + rng.Float64()
 
+	cores := powCores[rng.Intn(len(powCores))]
+	screenW := powScreens[rng.Intn(len(powScreens))]
+
+	navKey := fmt.Sprintf("webdriver-false-vendor-Google Inc.-cookieEnabled-true-pdfViewerEnabled-true-hardwareConcurrency-%d-language-%s-mimeTypes-[object MimeTypeArray]-userAgentData-[object NavigatorUAData]",
+		cores,
+		pickLang(rng))
+
+	dpl := "dpl=1440a687921de39ff5ee56b92807faaadce73f13"
+	if currentDPL != "" {
+		dpl = currentDPL
+	}
+
 	c := &POWConfig{userAgent: userAgent}
 	c.arr = [18]interface{}{
-		powCores[rng.Intn(len(powCores))] + powScreens[rng.Intn(len(powScreens))], // 0
-		timeStr,       // 1
-		nil,           // 2
-		rng.Float64(), // 3 - 迭代会覆盖
-		userAgent,     // 4
-		nil,           // 5
-		"dpl=1440a687921de39ff5ee56b92807faaadce73f13", // 6
-		"zh-CN",                               // 7
-		"zh-CN,zh,en-US,en",                   // 8
-		0,                                     // 9 - 迭代会覆盖
-		powNavKeys[rng.Intn(len(powNavKeys))], // 10
-		"location",                            // 11
-		powWinKeys[rng.Intn(len(powWinKeys))], // 12
-		perf,                                  // 13
-		randomUUID(rng),                       // 14
-		"",                                    // 15
-		8,                                     // 16
-		now.Unix(),                            // 17
+		cores + screenW,
+		timeStr,
+		nil,
+		rng.Float64(),
+		userAgent,
+		nil,
+		dpl,
+		"zh-CN",
+		"zh-CN,zh,en-US,en",
+		0,
+		navKey,
+		"location",
+		powWinKeys[rng.Intn(len(powWinKeys))],
+		perf,
+		randomUUID(rng),
+		"",
+		rng.Intn(8) + 4,
+		now.Unix(),
 	}
 	return c
 }
 
-// RequirementsToken 生成 /sentinel/chat-requirements 的 "p" 字段值。
-// 对齐 gen_image.py.get_requirements_token:固定难度 0fffff,前缀 gAAAAAC。
 func (c *POWConfig) RequirementsToken() string {
-	//nolint:gosec
 	seed := strconv.FormatFloat(rand.Float64(), 'f', -1, 64)
 	b64, ok := c.solveRequirements(seed, requirementsDifficulty)
 	if !ok {
@@ -132,23 +135,18 @@ func (c *POWConfig) RequirementsToken() string {
 	return powPrefixRequirements + b64
 }
 
-// solveRequirements 高性能迭代:预拼 JSON 的三段字节前缀,只在内循环拼 d1/d2。
-// 严格对齐 gen_image.py._generate_answer。
 func (c *POWConfig) solveRequirements(seed, difficulty string) (string, bool) {
 	target, err := hex.DecodeString(difficulty)
 	if err != nil {
 		return "", false
 	}
-	diffLen := len(difficulty) // 字符数(与 Python 对齐)
+	diffLen := len(difficulty)
 
-	// 预拼 p1/p2/p3。config[3] 和 config[9] 位置留给迭代器。
 	arr := c.arr
-	// p1 = json(arr[:3])[:-1] + ","
 	head, _ := json.Marshal([]interface{}{arr[0], arr[1], arr[2]})
 	p1 := append(head[:len(head)-1:len(head)-1], ',')
 
 	mid, _ := json.Marshal([]interface{}{arr[4], arr[5], arr[6], arr[7], arr[8]})
-	// p2 = "," + json(arr[4:9])[1:-1] + ","
 	p2 := make([]byte, 0, len(mid)+2)
 	p2 = append(p2, ',')
 	p2 = append(p2, mid[1:len(mid)-1]...)
@@ -157,7 +155,6 @@ func (c *POWConfig) solveRequirements(seed, difficulty string) (string, bool) {
 	tail, _ := json.Marshal([]interface{}{
 		arr[10], arr[11], arr[12], arr[13], arr[14], arr[15], arr[16], arr[17],
 	})
-	// p3 = "," + json(arr[10:])[1:]  => "," + "element1,...,elementN]"
 	p3 := make([]byte, 0, len(tail)+1)
 	p3 = append(p3, ',')
 	p3 = append(p3, tail[1:]...)
@@ -190,9 +187,6 @@ func (c *POWConfig) solveRequirements(seed, difficulty string) (string, bool) {
 		hasher.Write(b64buf)
 		sum := hasher.Sum(nil)
 
-		// Python: h[:diff_len] <= target
-		// diff_len 是字符数(6),target 是字节(3)。Python bytes cmp 按短的逐字节比较。
-		// 这里保持等价:取 min(len(target), len(sum)) 字节比较。
 		n2 := diffLen
 		if n2 > len(sum) {
 			n2 = len(sum)
@@ -208,8 +202,6 @@ func (c *POWConfig) solveRequirements(seed, difficulty string) (string, bool) {
 	return "", false
 }
 
-// SolveProofToken 按服务端挑战求解 proof token(header 用,前缀 gAAAAAB)。
-// 迁移自 gen_image.py.generate_proof_token 的轻量 13 元素 config。
 func SolveProofToken(seed, difficulty, userAgent string) (string, bool) {
 	if seed == "" || difficulty == "" {
 		return "", false
@@ -217,24 +209,35 @@ func SolveProofToken(seed, difficulty, userAgent string) (string, bool) {
 	if userAgent == "" {
 		userAgent = defaultUA
 	}
-	//nolint:gosec
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	screen := powScreens[rng.Intn(len(powScreens))] * (1 << rng.Intn(3)) // *1/2/4
+	screen := powScreens[rng.Intn(len(powScreens))] * (1 << rng.Intn(3))
 
 	timeStr := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 
+	cores := powCores[rng.Intn(len(powCores))]
+
+	turnstileURL := "https://tcr9i.chat.openai.com/v2/35536E1E-65B4-4D96-9D97-6ADB7EFF8147/api.js"
+	if currentTurnstileURL != "" {
+		turnstileURL = currentTurnstileURL
+	}
+
+	dpl := "dpl=1440a687921de39ff5ee56b92807faaadce73f13"
+	if currentDPL != "" {
+		dpl = currentDPL
+	}
+
 	proofConfig := []interface{}{
-		screen, // 0
+		screen,
 		timeStr,
 		nil,
-		0, // 3 - 迭代
+		0,
 		userAgent,
-		"https://tcr9i.chat.openai.com/v2/35536E1E-65B4-4D96-9D97-6ADB7EFF8147/api.js",
-		"dpl=1440a687921de39ff5ee56b92807faaadce73f13",
+		turnstileURL,
+		dpl,
 		"zh-CN",
 		"zh-CN",
 		nil,
-		"plugins−[object PluginArray]",
+		fmt.Sprintf("plugins-[object PluginArray]"),
 		powReactListeners[rng.Intn(len(powReactListeners))],
 		powProofEvents[rng.Intn(len(powProofEvents))],
 	}
@@ -258,6 +261,24 @@ func SolveProofToken(seed, difficulty, userAgent string) (string, bool) {
 	}
 	return powPrefixProof + powFallback +
 		base64.StdEncoding.EncodeToString([]byte(`"`+seed+`"`)), false
+}
+
+var (
+	currentDPL         string
+	currentTurnstileURL string
+)
+
+func SetDPL(dpl string) {
+	currentDPL = dpl
+}
+
+func SetTurnstileURL(url string) {
+	currentTurnstileURL = url
+}
+
+func pickLang(rng *rand.Rand) string {
+	langs := []string{"zh-CN", "en-US", "zh-TW", "ja-JP", "ko-KR"}
+	return langs[rng.Intn(len(langs))]
 }
 
 func randomUUID(rng *rand.Rand) string {

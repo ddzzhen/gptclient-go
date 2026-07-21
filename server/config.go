@@ -5,41 +5,37 @@ import (
 	"strconv"
 )
 
-// ServerConfig 服务器配置，全部从环境变量读取
 type ServerConfig struct {
-	// HTTP 服务
-	Host string // 监听地址，默认 0.0.0.0
-	Port string // 监听端口，默认 5005
+	Host string
+	Port string
 
-	// 鉴权：调用本服务的 API Key（区别于 ChatGPT Bearer Token）
-	// 若为空，则不校验 Authorization 头（直接将传入的 token 当作 ChatGPT token 使用）
 	Authorization string
 
-	// ChatGPT 客户端默认参数
-	DefaultModel string // 默认模型，默认 gpt-5-5-thinking
-	TempMode     bool   // 临时模式（不保存对话历史），默认 false
-	ImageDir     string // 图片保存目录，默认 images
+	DefaultModel string
+	TempMode     bool
+	ImageDir     string
 
-	// Token 池
-	TokensFile string // Token 持久化文件路径（JSON），默认 tokens.json
+	TokensFile string
 
-	// Session 管理
-	SessionTTLMinutes int // Session 不活跃超时（分钟），默认 120
+	SessionTTLMinutes int
 
-	// 对外地址（可选），用于生成绝对资源链接（图片/PDF 代理 URL）
-	// 例如：http://192.168.1.10:5005 或 https://your.domain
-	// 若为空，则从请求的 Host / X-Forwarded-Proto 头自动推断
 	BaseURL string
 
-	// Session Token 自动刷新：在 AT 过期前多少秒提前用 ST 换 AT，默认 300
 	TokenRefreshAheadSec int
 
-	// Telegram 通知：Session Token 刷新失败时提醒人工更新
 	TelegramBotToken string
 	TelegramChatID   string
+
+	BrowserEnabled     bool
+	BrowserHeadless    bool
+	BrowserChromePath  string
+	BrowserUserDataDir string
+	BrowserRemoteURL   string
+	BrowserTimeoutSec  int
+	UseBrowserProxy    bool
+	DataDir            string
 }
 
-// LoadConfig 从环境变量加载配置
 func LoadConfig() ServerConfig {
 	return ServerConfig{
 		Host:                 getEnv("HOST", "0.0.0.0"),
@@ -54,6 +50,14 @@ func LoadConfig() ServerConfig {
 		TokenRefreshAheadSec: getEnvInt("TOKEN_REFRESH_AHEAD_SEC", 300),
 		TelegramBotToken:     getEnv("TELEGRAM_BOT_TOKEN", ""),
 		TelegramChatID:       getEnv("TELEGRAM_CHAT_ID", ""),
+		BrowserEnabled:       getEnvBool("BROWSER_ENABLED", false),
+		BrowserHeadless:      getEnvBool("BROWSER_HEADLESS", true),
+		BrowserChromePath:    getEnv("BROWSER_CHROME_PATH", ""),
+		BrowserUserDataDir:   getEnv("BROWSER_USER_DATA_DIR", ""),
+		BrowserRemoteURL:     getEnv("BROWSER_REMOTE_URL", ""),
+		BrowserTimeoutSec:    getEnvInt("BROWSER_TIMEOUT_SEC", 60),
+		UseBrowserProxy:      getEnvBool("USE_BROWSER_PROXY", false),
+		DataDir:              getEnv("DATA_DIR", ""),
 	}
 }
 

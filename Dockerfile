@@ -3,36 +3,34 @@ FROM golang:1.25-alpine AS builder
 
 WORKDIR /build
 
-# 安装必要工具
 RUN apk add --no-cache git ca-certificates
 
-# 先复制依赖文件，利用缓存层
 COPY go.mod go.sum ./
 RUN go mod download
 
-# 复制源码并构建
 COPY . .
-# 限制并行编译，降低 1GB 等小内存 VPS 上的峰值内存占用。
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOMAXPROCS=1 \
     go build -p=1 -ldflags="-s -w" -o /build/sentinel-server ./cmd/server/
 
 # ─── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+# Install Chromium and required dependencies
+# chromium package version depends on Alpine repo; pin if needed
+RUN apk add --no-cache ca-certificates tzdata chromium nss freetype harfbuzz
 
-# 设置时区
+# Print installed Chromium version for verification
+RUN echo "Installed Chromium version:" && chromium-browser --version 2>/dev/null || chromium --version 2>/dev/null || echo "chromium not found in PATH"
+
 ENV TZ=Asia/Shanghai
 
 WORKDIR /app
 
-# 复制二进制文件
 COPY --from=builder /build/sentinel-server .
 
-# 创建数据目录
-RUN mkdir -p /app/images
+RUN mkdir -p /app/images /app/data
 
-# 默认环境变量
+# Default environment variables
 ENV HOST=0.0.0.0
 ENV PORT=5005
 ENV DEFAULT_MODEL=gpt-5-5-thinking
@@ -40,6 +38,13 @@ ENV TEMP_MODE=false
 ENV IMAGE_DIR=/app/images
 ENV TOKENS_FILE=/app/tokens.json
 ENV SESSION_TTL_MINUTES=120
+ENV DATA_DIR=/app/data
+
+# Browser mode defaults
+ENV BROWSER_ENABLED=true
+ENV BROWSER_HEADLESS=true
+# Auto-detect chromium path; override if needed
+# ENV BROWSER_CHROME_PATH=/usr/bin/chromium-browser
 
 EXPOSE 5005
 

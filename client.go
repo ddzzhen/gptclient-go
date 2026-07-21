@@ -1,21 +1,98 @@
 package sentinel
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/imroc/req/v3"
 )
 
 const (
-	defaultUA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"
+	tlsFingerprintChromeVersion = "131"
+
+	defaultUA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + tlsFingerprintChromeVersion + ".0.0.0 Safari/537.36"
 	defaultBuildHash   = "prod-81e0c5cdf6140e8c5db714d613337f4aeab94029"
 	defaultBuildNumber = "6128297"
 	defaultLang        = "zh-CN"
 	defaultModel       = "gpt-5-5-thinking"
+	deviceIDFile       = "device_id.json"
 )
 
-// Client 是 ChatGPT 对话客户端，封装了完整的 Sentinel 认证 + SSE 对话流程。
+type deviceIDEntry struct {
+	DeviceID  string    `json:"device_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+var deviceIDCache struct {
+	mu    sync.RWMutex
+	cache map[string]string
+}
+
+func init() {
+	deviceIDCache.cache = make(map[string]string)
+}
+
+func loadOrGenerateDeviceID(token, dataDir string) string {
+	key := tokenHash(token)
+
+	deviceIDCache.mu.RLock()
+	if cached, ok := deviceIDCache.cache[key]; ok && cached != "" {
+		deviceIDCache.mu.RUnlock()
+		return cached
+	}
+	deviceIDCache.mu.RUnlock()
+
+	if dataDir != "" {
+		filePath := filepath.Join(dataDir, deviceIDFile)
+		if data, err := os.ReadFile(filePath); err == nil {
+			var entries map[string]deviceIDEntry
+			if json.Unmarshal(data, &entries) == nil {
+				if entry, ok := entries[key]; ok && entry.DeviceID != "" {
+					deviceIDCache.mu.Lock()
+					deviceIDCache.cache[key] = entry.DeviceID
+					deviceIDCache.mu.Unlock()
+					return entry.DeviceID
+				}
+			}
+		}
+	}
+
+	newID := GenerateUUID()
+
+	deviceIDCache.mu.Lock()
+	deviceIDCache.cache[key] = newID
+	deviceIDCache.mu.Unlock()
+
+	if dataDir != "" {
+		_ = os.MkdirAll(dataDir, 0755)
+		filePath := filepath.Join(dataDir, deviceIDFile)
+		entries := make(map[string]deviceIDEntry)
+		if data, err := os.ReadFile(filePath); err == nil {
+			json.Unmarshal(data, &entries)
+		}
+		entries[key] = deviceIDEntry{DeviceID: newID, CreatedAt: time.Now()}
+		if data, err := json.MarshalIndent(entries, "", "  "); err == nil {
+			os.WriteFile(filePath, data, 0644)
+		}
+	}
+
+	return newID
+}
+
+func tokenHash(token string) string {
+	if len(token) > 32 {
+		return token[:32]
+	}
+	return token
+}
+
 type Client struct {
 	httpClient  *req.Client
 	bearerToken string
@@ -36,24 +113,81 @@ type Client struct {
 	tempMode        bool
 	turnCount       int
 
-	// Logf 日志输出函数，设为 nil 可禁用日志。默认 log.Printf。
+	browserMgr      *BrowserManager
+	useBrowserProxy bool
+	dataDir         string
+
+	screenWidth  int
+	screenHeight int
+	pixelRatio   float64
+	pageWidth    int
+	pageHeight   int
+
 	Logf LogFunc
 
-	// DisableAutoImage 设为 true 时，Chat/ChatStream 不会自动阻塞等待图片下载。
-	// 适合 DLL / 外部调用场景，由调用方自己异步处理图片下载。
 	DisableAutoImage bool
-
-	// StreamRecorder 非空时记录全部 SSE 事件（供 stream-capture 分析）。
-	StreamRecorder *StreamRecorder
+	StreamRecorder   *StreamRecorder
 }
 
-// NewClient 创建新的 ChatGPT 客户端
 func NewClient(cfg Config) *Client {
+	ua := orDefault(cfg.UserAgent, defaultUA)
+
+	deviceID := cfg.DeviceID
+	if deviceID == "" {
+		deviceID = loadOrGenerateDeviceID(cfg.BearerToken, cfg.DataDir)
+	}
+
+	var screenWidth, screenHeight int
+	var pixelRatio float64
+	var pageWidth, pageHeight int
+
+	if cfg.BrowserMgr != nil && cfg.BrowserMgr.IsReady() {
+		session := cfg.BrowserMgr.GetSession()
+		if session != nil {
+			if session.UserAgent != "" {
+				ua = session.UserAgent
+			}
+			if session.DeviceID != "" {
+				deviceID = session.DeviceID
+			}
+			if session.BuildHash != "" {
+				cfg.BuildHash = session.BuildHash
+			}
+			if session.BuildNumber != "" {
+				cfg.BuildNumber = session.BuildNumber
+			}
+			if session.CookieString != "" {
+				cfg.CookieString = session.CookieString
+			}
+			if session.AccessToken != "" && cfg.BearerToken == "" {
+				cfg.BearerToken = session.AccessToken
+			}
+			screenWidth = session.ScreenWidth
+			screenHeight = session.ScreenHeight
+			pixelRatio = session.PixelRatio
+			if session.DPL != "" {
+				SetDPL(session.DPL)
+			}
+		}
+	}
+
+	if screenWidth == 0 {
+		screenWidth = pickRandom([]int{1366, 1440, 1536, 1600, 1680, 1920, 2560})
+	}
+	if screenHeight == 0 {
+		screenHeight = pickRandom([]int{768, 900, 864, 900, 1050, 1080, 1440})
+	}
+	if pixelRatio == 0 {
+		pixelRatio = pickRandomFloat([]float64{1.0, 1.25, 1.5, 1.75, 2.0})
+	}
+	pageWidth = screenWidth - pickRandom([]int{0, 17, 24, 30})
+	pageHeight = screenHeight - pickRandom([]int{100, 110, 120, 130})
+
 	c := &Client{
 		bearerToken:     cfg.BearerToken,
 		cookieStr:       cfg.CookieString,
-		userAgent:       orDefault(cfg.UserAgent, defaultUA),
-		deviceID:        orDefault(cfg.DeviceID, GenerateUUID()),
+		userAgent:       ua,
+		deviceID:        deviceID,
 		buildHash:       orDefault(cfg.BuildHash, defaultBuildHash),
 		buildNumber:     orDefault(cfg.BuildNumber, defaultBuildNumber),
 		language:        orDefault(cfg.Language, defaultLang),
@@ -64,6 +198,14 @@ func NewClient(cfg Config) *Client {
 		sessionID:       GenerateUUID(),
 		startTime:       time.Now(),
 		tempMode:        cfg.TempMode,
+		browserMgr:      cfg.BrowserMgr,
+		useBrowserProxy: cfg.UseBrowserProxy,
+		dataDir:         cfg.DataDir,
+		screenWidth:     screenWidth,
+		screenHeight:    screenHeight,
+		pixelRatio:      pixelRatio,
+		pageWidth:       pageWidth,
+		pageHeight:      pageHeight,
 		Logf:            log.Printf,
 	}
 
@@ -72,41 +214,57 @@ func NewClient(cfg Config) *Client {
 		SetCommonHeaders(c.commonHeaders()).
 		ImpersonateChrome()
 
+	if cfg.BrowserMgr != nil && cfg.BrowserMgr.IsReady() {
+		session := cfg.BrowserMgr.GetSession()
+		if session != nil && session.UserAgent != "" {
+			if v := extractChromeVersion(session.UserAgent); v != "" {
+				if v != tlsFingerprintChromeVersion {
+					c.logf("[client] WARNING: browser Chrome/%s vs TLS fingerprint Chrome/%s mismatch; set USE_BROWSER_PROXY=true for full stealth", v, tlsFingerprintChromeVersion)
+				} else {
+					c.logf("[client] browser Chrome/%s matches TLS fingerprint ✓", v)
+				}
+			}
+		}
+	}
+
 	c.httpClient = httpC
 	return c
 }
 
-// HTTPClient 返回底层 req.Client 以便高级自定义
+func extractChromeVersion(ua string) string {
+	parts := strings.Split(ua, "Chrome/")
+	if len(parts) < 2 {
+		return ""
+	}
+	sub := strings.Split(parts[1], ".")
+	if len(sub) > 0 {
+		return sub[0]
+	}
+	return ""
+}
+
 func (c *Client) HTTPClient() *req.Client {
 	return c.httpClient
 }
 
-// ResetSession 重置对话上下文（开始新对话）
 func (c *Client) ResetSession() {
 	c.conversationID = ""
 	c.parentMessageID = "client-created-root"
 	c.turnCount = 0
 }
 
-// SetModel 切换模型
 func (c *Client) SetModel(model string) { c.model = model }
+func (c *Client) GetModel() string      { return c.model }
 
-// GetModel 获取当前模型
-func (c *Client) GetModel() string { return c.model }
-
-// SetTempMode 设置临时模式
 func (c *Client) SetTempMode(enabled bool) { c.tempMode = enabled }
 
-// SetDisableAutoImage 设置是否禁用自动图片下载（DLL 场景使用）
 func (c *Client) SetDisableAutoImage(disabled bool) { c.DisableAutoImage = disabled }
 
-// SetBearerToken 更新 Bearer Token（Session Token 刷新后调用）。
 func (c *Client) SetBearerToken(token string) {
 	c.bearerToken = token
 	c.httpClient.SetCommonHeader("Authorization", "Bearer "+token)
 }
 
-// SetCSRFToken updates the optional CSRF/XSRF header used if upstream starts requiring it.
 func (c *Client) SetCSRFToken(token string) {
 	c.csrfToken = token
 	if token == "" {
@@ -118,13 +276,10 @@ func (c *Client) SetCSRFToken(token string) {
 	c.httpClient.SetCommonHeader("X-XSRF-Token", token)
 }
 
-// SetConversationID 恢复到指定对话
 func (c *Client) SetConversationID(id string) { c.conversationID = id }
 
-// SetParentMessageID 设置父消息 ID（用于指定回复位置）
 func (c *Client) SetParentMessageID(id string) { c.parentMessageID = id }
 
-// GetSessionInfo 获取当前会话状态
 func (c *Client) GetSessionInfo() SessionInfo {
 	return SessionInfo{
 		ConversationID:  c.conversationID,
@@ -142,10 +297,19 @@ func (c *Client) logf(format string, args ...interface{}) {
 }
 
 func (c *Client) commonHeaders() map[string]string {
+	chromeMajor := extractChromeVersion(c.userAgent)
+	if chromeMajor == "" {
+		chromeMajor = tlsFingerprintChromeVersion
+	}
+
+	secCHUA := fmt.Sprintf(`"Chromium";v="%s", "Not-A.Brand";v="24", "Google Chrome";v="%s"`, chromeMajor, chromeMajor)
+	secCHUAFull := fmt.Sprintf(`"Chromium";v="%s.0.0.0", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="%s.0.0.0"`, chromeMajor, chromeMajor)
+
 	h := map[string]string{
 		"Authorization":               "Bearer " + c.bearerToken,
 		"User-Agent":                  c.userAgent,
 		"Accept-Language":             c.language + ",zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+		"Accept-Encoding":             "gzip, deflate, br, zstd",
 		"oai-language":                c.language,
 		"oai-device-id":               c.deviceID,
 		"oai-session-id":              c.sessionID,
@@ -153,15 +317,15 @@ func (c *Client) commonHeaders() map[string]string {
 		"oai-client-build-number":     c.buildNumber,
 		"Origin":                      "https://chatgpt.com",
 		"Referer":                     "https://chatgpt.com/",
-		"sec-ch-ua":                   `"Chromium";v="147", "Not-A.Brand";v="24", "Microsoft Edge";v="147"`,
+		"sec-ch-ua":                   secCHUA,
 		"sec-ch-ua-mobile":            "?0",
 		"sec-ch-ua-platform":          `"Windows"`,
 		"sec-ch-ua-platform-version":  `"19.0.0"`,
 		"sec-ch-ua-arch":              `"x86"`,
 		"sec-ch-ua-bitness":           `"64"`,
 		"sec-ch-ua-model":             `""`,
-		"sec-ch-ua-full-version":      `"147.0.0.0"`,
-		"sec-ch-ua-full-version-list": `"Chromium";v="147.0.0.0", "Not-A.Brand";v="24.0.0.0", "Microsoft Edge";v="147.0.0.0"`,
+		"sec-ch-ua-full-version":      fmt.Sprintf(`"%s.0.0.0"`, chromeMajor),
+		"sec-ch-ua-full-version-list": secCHUAFull,
 		"sec-fetch-dest":              "empty",
 		"sec-fetch-mode":              "cors",
 		"sec-fetch-site":              "same-origin",
@@ -174,4 +338,17 @@ func (c *Client) commonHeaders() map[string]string {
 		h["X-XSRF-Token"] = c.csrfToken
 	}
 	return h
+}
+
+func (c *Client) jitterSleep() {
+	delay := time.Duration(200+rand.Intn(800)) * time.Millisecond
+	time.Sleep(delay)
+}
+
+func pickRandom(options []int) int {
+	return options[rand.Intn(len(options))]
+}
+
+func pickRandomFloat(options []float64) float64 {
+	return options[rand.Intn(len(options))]
 }
