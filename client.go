@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	tlsFingerprintChromeVersion = "131"
+	tlsFingerprintChromeVersion = "150"
 
 	defaultUA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + tlsFingerprintChromeVersion + ".0.0.0 Safari/537.36"
 	defaultBuildHash   = "prod-81e0c5cdf6140e8c5db714d613337f4aeab94029"
