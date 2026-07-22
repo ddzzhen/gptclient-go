@@ -1,0 +1,33 @@
+services:
+  sentinel-go:
+    build: .
+    container_name: sentinel-go
+    restart: unless-stopped
+    ports:
+      - "5006:5005"
+    environment:
+      PORT: "5005"
+      AUTHORIZATION: ""
+      DEFAULT_MODEL: "gpt-5-5-thinking"
+      TEMP_MODE: "false"
+      SESSION_TTL_MINUTES: "120"
+      TELEGRAM_BOT_TOKEN: "7957278503:AAFQVqaKB2Oo1NYVIdNyMbmG_2ewH2_9_oc"
+      TELEGRAM_CHAT_ID: "666187169"
+      # Browser mode disabled — credentials from browser_session.json
+      BROWSER_ENABLED: "false"
+      BROWSER_SESSION_FILE: "/app/data/browser_session.json"
+      DATA_DIR: "/app/data"
+    volumes:
+      - ./tokens.json:/app/tokens.json
+      - ./images:/app/images
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5005/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - proxy-net
+networks:
+  proxy-net:
+    external: true
