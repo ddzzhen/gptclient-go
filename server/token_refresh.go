@@ -15,7 +15,7 @@ import (
 
 const (
 	sessionAuthURL             = "https://chatgpt.com/api/auth/session"
-	tlsFingerprintChromeVersion = "131"
+	tlsFingerprintChromeVersion = "150"
 )
 
 var defaultRefreshUA = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36", tlsFingerprintChromeVersion)
@@ -39,7 +39,6 @@ func RefreshATFromSession(sessionToken string) (accessToken string, expiresAt ti
 			"Origin":               "https://chatgpt.com",
 			"User-Agent":           defaultRefreshUA,
 			"Accept-Language":      "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-			"Accept-Encoding":      "gzip, deflate, br, zstd",
 			"Cookie":               cookieVal,
 			"sec-ch-ua":            fmt.Sprintf(`"Chromium";v="%s", "Not-A.Brand";v="24", "Google Chrome";v="%s"`, tlsFingerprintChromeVersion, tlsFingerprintChromeVersion),
 			"sec-ch-ua-mobile":     "?0",
