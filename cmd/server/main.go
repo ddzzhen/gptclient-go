@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"context"
+	"os"
 	"fmt"
+	"strings"
 	"log"
 	"time"
 
@@ -12,6 +15,34 @@ import (
 
 func main() {
 	cfg := server.LoadConfig()
+
+	// Load browser session data from JSON file if specified
+	if cfg.BrowserSessionFile != "" {
+		bsData, err := os.ReadFile(cfg.BrowserSessionFile)
+		if err != nil {
+			log.Printf("[startup] WARNING: failed to read browser session file %s: %v", cfg.BrowserSessionFile, err)
+		} else {
+			var bs struct {
+				CookieString string `json:"cookie_string"`
+				DeviceID     string `json:"device_id"`
+				UserAgent    string `json:"user_agent"`
+			}
+			if err := json.Unmarshal(bsData, &bs); err != nil {
+				log.Printf("[startup] WARNING: failed to parse browser session: %v", err)
+			} else {
+				if cfg.CookieString == "" && bs.CookieString != "" {
+					cfg.CookieString = bs.CookieString
+				}
+				if cfg.DeviceID == "" && bs.DeviceID != "" {
+					cfg.DeviceID = bs.DeviceID
+				}
+				if cfg.UserAgentOverride == "" && bs.UserAgent != "" {
+					cfg.UserAgentOverride = bs.UserAgent
+				}
+				log.Printf("[startup] Browser session loaded: device_id=%s ua=%s", cfg.DeviceID, cfg.UserAgentOverride)
+			}
+		}
+	}
 
 	log.Printf("============================================")
 	log.Printf("  sentinel-go API Server")
@@ -67,6 +98,31 @@ func main() {
 
 	notifier := server.NewTelegramNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
 	pool := server.NewTokenPool(cfg.TokensFile, time.Duration(cfg.TokenRefreshAheadSec)*time.Second, notifier)
+
+	// Inject browser-obtained access token into the pool so pool-mode middleware
+	// and auth-retry logic can use it.  Also extract the session token from the
+	// cookie string for automatic refresh.
+	if browserMgr != nil && browserMgr.IsReady() {
+		if bs := browserMgr.GetSession(); bs != nil && bs.AccessToken != "" {
+			chunk := bs.AccessToken
+			// Try to extract the session token from the cookie string for refresh support.
+			for _, part := range strings.Split(bs.CookieString, ";") {
+				part = strings.TrimSpace(part)
+				if strings.HasPrefix(part, "__Secure-next-auth.session-token=") {
+					st := strings.TrimPrefix(part, "__Secure-next-auth.session-token=")
+					if st != "" {
+						chunk = bs.AccessToken + "----" + st
+						break
+					}
+				}
+			}
+			added := pool.Add(chunk)
+			log.Printf("[startup] Browser token injected into pool (added=%d)", added)
+		} else {
+			log.Printf("[startup] Browser session has no access token; pool will use existing tokens")
+		}
+	}
+
 	total, valid, _ := pool.Stats()
 	log.Printf("[startup] Token pool: total=%d, valid=%d", total, valid)
 

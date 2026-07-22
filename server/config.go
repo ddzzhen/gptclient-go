@@ -26,14 +26,20 @@ type ServerConfig struct {
 	TelegramBotToken string
 	TelegramChatID   string
 
-	BrowserEnabled     bool
-	BrowserHeadless    bool
-	BrowserChromePath  string
-	BrowserUserDataDir string
-	BrowserRemoteURL   string
-	BrowserTimeoutSec  int
-	UseBrowserProxy    bool
-	DataDir            string
+	BrowserEnabled      bool
+	BrowserHeadless     bool
+	BrowserChromePath   string
+	BrowserUserDataDir  string
+	BrowserRemoteURL    string
+	BrowserTimeoutSec   int
+	UseBrowserProxy     bool
+	DataDir             string
+
+	// Browser session data (from MCP-extracted browser session)
+	BrowserSessionFile string
+	CookieString       string
+	DeviceID           string
+	UserAgentOverride  string
 }
 
 func LoadConfig() ServerConfig {
@@ -58,6 +64,10 @@ func LoadConfig() ServerConfig {
 		BrowserTimeoutSec:    getEnvInt("BROWSER_TIMEOUT_SEC", 60),
 		UseBrowserProxy:      getEnvBool("USE_BROWSER_PROXY", false),
 		DataDir:              getEnv("DATA_DIR", ""),
+		BrowserSessionFile:   getEnv("BROWSER_SESSION_FILE", ""),
+		CookieString:         getEnv("COOKIE_STRING", ""),
+		DeviceID:             getEnv("DEVICE_ID", ""),
+		UserAgentOverride:    getEnv("USER_AGENT", ""),
 	}
 }
 

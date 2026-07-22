@@ -43,3 +43,4 @@ cmd/dll/
 
 # 配置文件 (避免泄露 Token)
 config.json
+data/

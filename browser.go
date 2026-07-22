@@ -116,10 +116,11 @@ func (bm *BrowserManager) Launch(ctx context.Context) error {
 		}),
 	)
 
-	timeoutCtx, timeoutCancel := context.WithTimeout(bm.browserCtx, bm.cfg.Timeout)
-	defer timeoutCancel()
-
-	if err := chromedp.Run(timeoutCtx, chromedp.Navigate("about:blank")); err != nil {
+	//  Use bm.browserCtx directly — a derived timeout context would be cancelled
+	//  when this function returns (defer timeoutCancel), which chromedp interprets
+	//  as a request to tear down the browser session. Timeouts for individual
+	//  operations are handled by the caller-supplied ctx via the allocCtx.
+	if err := chromedp.Run(bm.browserCtx, chromedp.Navigate("about:blank")); err != nil {
 		bm.browserCancel()
 		bm.allocCancel()
 		return fmt.Errorf("browser launch failed: %w", err)
@@ -137,28 +138,57 @@ func (bm *BrowserManager) Authenticate(ctx context.Context) (*BrowserSession, er
 		return nil, fmt.Errorf("browser not launched, call Launch() first")
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(bm.browserCtx, bm.cfg.Timeout)
-	defer cancel()
+	//  Use bm.browserCtx directly to avoid the timeout context being cancelled
+	//  when this function returns, which would close the browser session.
+	//  Individual operation timeouts are bounded by the polling loop below.
 
 	if bm.cfg.CookieString != "" || bm.cfg.SessionToken != "" {
-		if err := bm.injectCookies(timeoutCtx); err != nil {
+		if err := bm.injectCookies(bm.browserCtx); err != nil {
 			bm.Logf("[browser] cookie injection warning: %v", err)
 		}
 	}
 
 	bm.Logf("[browser] navigating to chatgpt.com...")
-	if err := chromedp.Run(timeoutCtx,
+	if err := chromedp.Run(bm.browserCtx,
 		chromedp.Navigate("https://chatgpt.com"),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 	); err != nil {
 		return nil, fmt.Errorf("navigate to chatgpt.com: %w", err)
 	}
 
-	time.Sleep(3 * time.Second)
+	//  Poll for login: check localStorage/sessionStorage for access token every
+	//  3 seconds.  This window lets the user manually log in to chatgpt.com
+	//  in the visible Chrome window before we capture the session.
+	bm.Logf("[browser] waiting for user login (timeout=%s)...", bm.cfg.Timeout)
+	deadline, _ := ctx.Deadline()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(bm.cfg.Timeout)
+	}
+	var session *BrowserSession
+	var err error
+	pollStart := time.Now()
+	for time.Until(deadline) > 3*time.Second {
+		var s *BrowserSession
+		s, err = bm.extractSession(bm.browserCtx)
+		if err == nil && s != nil && s.AccessToken != "" {
+			session = s
+			break
+		}
+		elapsed := int(time.Since(pollStart).Seconds())
+		bm.Logf("[browser] not logged in yet (elapsed=%ds), waiting for login...", elapsed)
+		time.Sleep(3 * time.Second)
+	}
 
-	session, err := bm.extractSession(timeoutCtx)
-	if err != nil {
-		return nil, fmt.Errorf("extract session: %w", err)
+	if session == nil {
+		//  Last attempt even if polling timed out — partial session is still useful
+		//  (device ID, UA, build hash, cookies).
+		session, err = bm.extractSession(bm.browserCtx)
+		if err != nil {
+			return nil, fmt.Errorf("extract session: %w", err)
+		}
+		bm.Logf("[browser] login timed out, continuing with partial session (access_token may be empty)")
+	} else {
+		bm.Logf("[browser] login detected after %s", time.Since(pollStart).Truncate(time.Second))
 	}
 
 	bm.session = session
@@ -168,16 +198,16 @@ func (bm *BrowserManager) Authenticate(ctx context.Context) (*BrowserSession, er
 }
 
 func (bm *BrowserManager) injectCookies(ctx context.Context) error {
-	cookies := make([]*storage.CookieParam, 0)
+	cookies := make([]*network.CookieParam, 0)
 
 	if bm.cfg.SessionToken != "" {
-		cookies = append(cookies, &storage.CookieParam{
+		cookies = append(cookies, &network.CookieParam{
 			Name:     "__Secure-next-auth.session-token",
 			Value:    bm.cfg.SessionToken,
 			URL:      "https://chatgpt.com",
 			Secure:   true,
 			HTTPOnly: true,
-			SameSite: storage.CookieSameSiteLax,
+			SameSite: network.CookieSameSiteLax,
 		})
 	}
 
@@ -191,7 +221,7 @@ func (bm *BrowserManager) injectCookies(ctx context.Context) error {
 			if len(kv) != 2 {
 				continue
 			}
-			cookies = append(cookies, &storage.CookieParam{
+			cookies = append(cookies, &network.CookieParam{
 				Name:  strings.TrimSpace(kv[0]),
 				Value: strings.TrimSpace(kv[1]),
 				URL:   "https://chatgpt.com",

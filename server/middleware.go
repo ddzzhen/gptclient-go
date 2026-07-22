@@ -30,13 +30,16 @@ func AuthMiddleware(cfg *ServerConfig, pool *TokenPool) gin.HandlerFunc {
 		// 从请求头提取 Bearer Token（兼容 "Bearer eyJ..." 和 "Bearer" 无空格两种情况）
 		auth := c.GetHeader("Authorization")
 		// 先去掉 "Bearer "（有空格），再去掉 "Bearer"（无空格），最后 TrimSpace
-		token := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(auth, "Bearer "), "Bearer"))
-		token = cleanToken(token)
+		raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(auth, "Bearer "), "Bearer"))
+
+		// 注意：AUTHORIZATION 密码可以是任意字符串（如 "sk-..."），不能用 cleanToken 校验。
+		// cleanToken 仅校验 ChatGPT access token（JWT），会把非 JWT 的密码清成空串，
+		// 导致密码匹配永远失败。因此密码比对使用原始值，cleanToken 只在透传 ChatGPT token 时使用。
 
 		// 允许“免密模式”或“密码匹配模式”：
-		// - 如果传入的 token 就是我们配置的 AUTHORIZATION 密码
-		// - 如果传入的 token 为空，且我们没有配置密码（完全开放给本地使用）
-		if (cfg.Authorization != "" && token == cfg.Authorization) || (cfg.Authorization == "" && token == "") {
+		// - 如果传入的 raw 就是我们配置的 AUTHORIZATION 密码
+		// - 如果传入的 raw 为空，且我们没有配置密码（完全开放给本地使用）
+		if (cfg.Authorization != "" && raw == cfg.Authorization) || (cfg.Authorization == "" && raw == "") {
 			chatgptToken, ok := pool.Pick()
 			if !ok {
 				c.AbortWithStatusJSON(http.StatusServiceUnavailable, ErrorResponse{
@@ -50,7 +53,7 @@ func AuthMiddleware(cfg *ServerConfig, pool *TokenPool) gin.HandlerFunc {
 			}
 			c.Set("chatgpt_token", chatgptToken)
 			c.Set("from_pool", true)
-		} else if cfg.Authorization != "" && token != "" {
+		} else if cfg.Authorization != "" && raw != "" {
 			// 如果配置了密码，且传入了密码，但不匹配
 			c.AbortWithStatusJSON(http.StatusUnauthorized, ErrorResponse{
 				Error: ErrorDetail{
@@ -60,8 +63,8 @@ func AuthMiddleware(cfg *ServerConfig, pool *TokenPool) gin.HandlerFunc {
 				},
 			})
 			return
-		} else if token == "" {
-			// 这种情况只有一种：配了密码，但是 token 为空，此时应该提示需要鉴权
+		} else if raw == "" {
+			// 这种情况只有一种：配了密码，但是没有传入 token，此时应该提示需要鉴权
 			c.AbortWithStatusJSON(http.StatusUnauthorized, ErrorResponse{
 				Error: ErrorDetail{
 					Message: "Missing Authorization header",
@@ -71,7 +74,13 @@ func AuthMiddleware(cfg *ServerConfig, pool *TokenPool) gin.HandlerFunc {
 			})
 			return
 		} else {
-			// 未配置 AUTHORIZATION，且传入了 token，直接将 token 作为 ChatGPT Bearer token 透传
+			// 未配置 AUTHORIZATION，且传入了 token，将其作为 ChatGPT Bearer token 透传。
+			// cleanToken 可从 JSON / "at----st" 组合中提取 access token；无法识别则原样透传，
+			// 避免把合法的非标准 token 误清成空串。
+			token := cleanToken(raw)
+			if token == "" {
+				token = raw
+			}
 			c.Set("chatgpt_token", token)
 			c.Set("from_pool", false)
 		}

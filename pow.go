@@ -214,8 +214,6 @@ func SolveProofToken(seed, difficulty, userAgent string) (string, bool) {
 
 	timeStr := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 
-	cores := powCores[rng.Intn(len(powCores))]
-
 	turnstileURL := "https://tcr9i.chat.openai.com/v2/35536E1E-65B4-4D96-9D97-6ADB7EFF8147/api.js"
 	if currentTurnstileURL != "" {
 		turnstileURL = currentTurnstileURL

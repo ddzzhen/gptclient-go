@@ -64,6 +64,9 @@ func (sm *SessionManager) GetOrCreate(convID, token string) *sessionEntry {
 		BrowserMgr:      sm.browserMgr,
 		UseBrowserProxy: sm.cfg.UseBrowserProxy,
 		DataDir:         sm.cfg.DataDir,
+		CookieString:    sm.cfg.CookieString,
+		DeviceID:        sm.cfg.DeviceID,
+		UserAgent:       sm.cfg.UserAgentOverride,
 	}
 
 	client := sentinel.NewClient(clientCfg)
