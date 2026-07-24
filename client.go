@@ -130,7 +130,7 @@ type Client struct {
 }
 
 func NewClient(cfg Config) *Client {
-	ua := orDefault(cfg.UserAgent, defaultUA)
+	ua := normalizeUA(orDefault(cfg.UserAgent, defaultUA))
 
 	deviceID := cfg.DeviceID
 	if deviceID == "" {
@@ -145,7 +145,7 @@ func NewClient(cfg Config) *Client {
 		session := cfg.BrowserMgr.GetSession()
 		if session != nil {
 			if session.UserAgent != "" {
-				ua = session.UserAgent
+				ua = normalizeUA(session.UserAgent)
 			}
 			if session.DeviceID != "" {
 				deviceID = session.DeviceID
@@ -219,9 +219,9 @@ func NewClient(cfg Config) *Client {
 		if session != nil && session.UserAgent != "" {
 			if v := extractChromeVersion(session.UserAgent); v != "" {
 				if v != tlsFingerprintChromeVersion {
-					c.logf("[client] WARNING: browser Chrome/%s vs TLS fingerprint Chrome/%s mismatch; set USE_BROWSER_PROXY=true for full stealth", v, tlsFingerprintChromeVersion)
+					c.logf("[client] UA normalized: Chrome/%s → Chrome/%s (matches TLS fingerprint)", v, tlsFingerprintChromeVersion)
 				} else {
-					c.logf("[client] browser Chrome/%s matches TLS fingerprint ✓", v)
+					c.logf("[client] UA Chrome/%s matches TLS fingerprint ✓", v)
 				}
 			}
 		}
@@ -241,6 +241,42 @@ func extractChromeVersion(ua string) string {
 		return sub[0]
 	}
 	return ""
+}
+
+// detectPlatformFromUA extracts the OS platform from a User-Agent string.
+// Returns "Windows", "macOS", "Linux", "Android", "iOS", or "" if unknown.
+func detectPlatformFromUA(ua string) string {
+	lower := strings.ToLower(ua)
+	// Order matters: Android/Linux UA often contains "linux" too
+	switch {
+	case strings.Contains(lower, "android"):
+		return "Android"
+	case strings.Contains(lower, "iphone") || strings.Contains(lower, "ipad") || strings.Contains(lower, "ipod"):
+		return "iOS"
+	case strings.Contains(lower, "macintosh") || strings.Contains(lower, "mac os x") || strings.Contains(lower, "macos"):
+		return "macOS"
+	case strings.Contains(lower, "linux"):
+		return "Linux"
+	case strings.Contains(lower, "windows"):
+		return "Windows"
+	default:
+		return ""
+	}
+}
+
+// normalizeUA ensures the Chrome version in UA matches the TLS fingerprint version.
+// If they differ, the UA is rewritten to use the TLS Chrome version while preserving
+// the platform and architecture info from the original UA.
+func normalizeUA(ua string) string {
+	uaChromeVer := extractChromeVersion(ua)
+	if uaChromeVer == "" || uaChromeVer == tlsFingerprintChromeVersion {
+		return ua // already matching or unknown
+	}
+	// Replace all occurrences of Chrome/<old> to Chrome/<new> in the UA string
+	normalized := strings.ReplaceAll(ua,
+		"Chrome/"+uaChromeVer,
+		"Chrome/"+tlsFingerprintChromeVersion)
+	return normalized
 }
 
 func (c *Client) HTTPClient() *req.Client {
@@ -297,19 +333,48 @@ func (c *Client) logf(format string, args ...interface{}) {
 }
 
 func (c *Client) commonHeaders() map[string]string {
-	chromeMajor := extractChromeVersion(c.userAgent)
-	if chromeMajor == "" {
-		chromeMajor = tlsFingerprintChromeVersion
-	}
+	// Always use the TLS fingerprint version for Sec-CH-UA headers, not
+	// whatever the raw UA string happens to contain.  This keeps the
+	// Client Hints consistent with the impersonated TLS handshake.
+	chromeMajor := tlsFingerprintChromeVersion
 
 	secCHUA := fmt.Sprintf(`"Chromium";v="%s", "Not-A.Brand";v="24", "Google Chrome";v="%s"`, chromeMajor, chromeMajor)
 	secCHUAFull := fmt.Sprintf(`"Chromium";v="%s.0.0.0", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="%s.0.0.0"`, chromeMajor, chromeMajor)
+
+	// Detect platform from UA for consistent Sec-CH-UA-Platform
+	platform := detectPlatformFromUA(c.userAgent)
+	platformVer := ""
+	arch := "x86"
+	bitness := "64"
+	switch platform {
+	case "macOS":
+		platformVer = "14.7.0" // macOS Sonoma
+		bitness = ""
+	case "Windows":
+		platformVer = "19.0.0"
+		arch = "x86"
+	case "Linux":
+		platformVer = "6.8.0"
+		arch = "x86"
+	case "Android":
+		platform = "Android"
+		platformVer = "14.0.0"
+		arch = ""
+		bitness = ""
+	case "iOS":
+		platformVer = "18.0.0"
+		arch = ""
+		bitness = ""
+	default:
+		platform = "Windows"
+		platformVer = "19.0.0"
+	}
 
 	h := map[string]string{
 		"Authorization":               "Bearer " + c.bearerToken,
 		"User-Agent":                  c.userAgent,
 		"Accept-Language":             c.language + ",zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-				"oai-language":                c.language,
+		"oai-language":                c.language,
 		"oai-device-id":               c.deviceID,
 		"oai-session-id":              c.sessionID,
 		"oai-client-version":          c.buildHash,
@@ -318,10 +383,10 @@ func (c *Client) commonHeaders() map[string]string {
 		"Referer":                     "https://chatgpt.com/",
 		"sec-ch-ua":                   secCHUA,
 		"sec-ch-ua-mobile":            "?0",
-		"sec-ch-ua-platform":          `"Windows"`,
-		"sec-ch-ua-platform-version":  `"19.0.0"`,
-		"sec-ch-ua-arch":              `"x86"`,
-		"sec-ch-ua-bitness":           `"64"`,
+		"sec-ch-ua-platform":          fmt.Sprintf(`"%s"`, platform),
+		"sec-ch-ua-platform-version":  fmt.Sprintf(`"%s"`, platformVer),
+		"sec-ch-ua-arch":              fmt.Sprintf(`"%s"`, arch),
+		"sec-ch-ua-bitness":           fmt.Sprintf(`"%s"`, bitness),
 		"sec-ch-ua-model":             `""`,
 		"sec-ch-ua-full-version":      fmt.Sprintf(`"%s.0.0.0"`, chromeMajor),
 		"sec-ch-ua-full-version-list": secCHUAFull,

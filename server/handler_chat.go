@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,8 +31,12 @@ func NewChatHandler(cfg *ServerConfig, pool *TokenPool, session *SessionManager)
 
 // Handle 处理 POST /v1/chat/completions
 func (h *ChatHandler) Handle(c *gin.Context) {
+	// Snapshot raw body before ShouldBindJSON consumes it.
+	rawBody := readBodyForDiagnostic(c)
+
 	var req ChatCompletionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[diag-400] POST /v1/chat/completions JSON parse failed: %v | body_preview=%s", err, truncateForLog(rawBody, 500))
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: ErrorDetail{Message: "Invalid JSON body", Type: "invalid_request_error"},
 		})
@@ -47,6 +53,7 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 	// 提取最后一条 user 消息作为本轮输入
 	userMsg, systemPrompt, b64Images := extractUserMessage(req.Messages)
 	if userMsg == "" && len(b64Images) == 0 {
+		log.Printf("[diag-400] POST /v1/chat/completions no user message: model=%s stream=%v messages=%d body_preview=%s", req.Model, req.Stream, len(req.Messages), truncateForLog(rawBody, 200))
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error: ErrorDetail{Message: "No user message or images found in messages", Type: "invalid_request_error"},
 		})
@@ -699,4 +706,24 @@ func sizeToAspect(size string) sentinel.ImageAspectRatio {
 	default:
 		return sentinel.ImageAspectAuto
 	}
+}
+
+// readBodyForDiagnostic reads and returns the raw request body for diagnostic logging.
+// It replaces the consumed body so further reads still work.
+func readBodyForDiagnostic(c *gin.Context) string {
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return "(read error: " + err.Error() + ")"
+	}
+	// Restore body for potential downstream consumers
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	return string(raw)
+}
+
+// truncateForLog truncates s to maxLen bytes for safe log output, adding "…" if cut.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
 }
